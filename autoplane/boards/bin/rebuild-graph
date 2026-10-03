@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Rehace desde cero el grafo AGE de la org `default` (solo el proyecto cortex vive ahí).
+# Los nodos viejos tienen datos que la consulta de llamadas actual no espera
+# (POST /api/v1/calls/batch → 42P01) y sus nombres ya eran ilegibles.
+# No toca las tablas relacionales (decisiones, conocimiento, sesiones, usuarios, tokens).
+# Lo ejecuta la persona: borra el grafo de la base real `cortex`. Confirma con CONFIRM=SI.
+set -euo pipefail
+ROOT=/mnt/ssd500/projects/personal/cortex
+cd "$ROOT"
+set -a; . ~/.config/cortex/core.env; set +a
+stamp=$(date +%Y%m%dT%H%M%S)
+graph=$(psql "$CORTEX_DSN" -At -c "select g.name from ag_catalog.ag_graph g join orgs o on g.name = 'cortex_' || replace(o.id::text, '-', '') where o.name = 'default'")
+[ -n "$graph" ] || { echo "no encuentro el grafo de la org default"; exit 1; }
+
+echo "== 0. Grafo $graph"
+psql "$CORTEX_DSN" -At -c "select 'nodos', count(*) from \"$graph\"._ag_label_vertex union all select 'aristas', count(*) from \"$graph\"._ag_label_edge"
+
+echo "== 1. Respaldo completo de la base"
+mkdir -p backups
+pg_dump "$CORTEX_DSN" -Fc -f "backups/cortex-before-graph-rebuild-$stamp.dump"
+ls -la "backups/cortex-before-graph-rebuild-$stamp.dump"
+
+ok=${CONFIRM:-}
+if [ -z "$ok" ] && [ -t 0 ]; then read -r -p "¿Borrar el grafo $graph y reindexar? Escribe SI: " ok; fi
+[ "$ok" = "SI" ] || { echo "cancelado: nada borrado (confirma con CONFIRM=SI)"; exit 1; }
+
+echo "== 2. Parar el Core y borrar el grafo"
+systemctl --user stop cortex-core
+psql "$CORTEX_DSN" -v ON_ERROR_STOP=1 -c "LOAD 'age'; SET search_path = ag_catalog, \"\$user\", public; SELECT drop_graph('$graph', true);"
+
+echo "== 3. Arrancar el Core (recrea el grafo y su esquema)"
+systemctl --user start cortex-core
+for i in $(seq 1 60); do curl -sf http://127.0.0.1:8742/health >/dev/null && break; sleep 1; done
+echo "Core: $(curl -s http://127.0.0.1:8742/health)"
+
+echo "== 4. Reindexar y mapear Cortex"
+export CORTEX_TOKEN=$(cat ~/.config/cortex/agent-token)
+bin/cortex index . --project cortex --apply 2>&1 | tail -3
+bin/cortex map . --project cortex --apply 2>&1 | tail -2
+psql "$CORTEX_DSN" -At -c "select 'nodos', count(*) from \"$graph\"._ag_label_vertex union all select 'aristas', count(*) from \"$graph\"._ag_label_edge"
+echo "== listo. Respaldo: backups/cortex-before-graph-rebuild-$stamp.dump"

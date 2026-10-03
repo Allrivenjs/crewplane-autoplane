@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Ejecuta un comando (p. ej. git commit) con el mismo cerrojo que usan los tableros.
+# Uso: .crewplane/bin/with-repo-lock git commit -m "..."
+set -e
+cd "$(dirname "$0")/../.."
+exec flock -x .crewplane/repo.lock "$@"

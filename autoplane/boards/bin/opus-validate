@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""Validación Opus de las tareas fusionadas de un módulo contra sus criterios.
+
+Uso: CORTEX_PLAN=<plan> .crewplane/bin/opus-validate <MÓDULO>
+Escribe revisiones/<plan>/<MÓDULO>.md y una corrección por tarea no LISTA en
+revisiones/<plan>/correcciones/<TAREA>.md. No toca el tablero ni el código.
+"""
+import sys
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+L = SourceFileLoader("lib", str(Path(__file__).with_name("opus-review-lib.py"))).load_module()
+mod = sys.argv[1].upper()
+tasks = L.rows(mod)
+done = [t for t in tasks if t[2] in ("En validación", "Hecha") and t[3]]
+if not done:
+    raise SystemExit(f"{mod}: nada fusionado que validar")
+prev_f = L.R / "v1" / f"{mod}.md"
+prev = prev_f.read_text() if prev_f.exists() else "(sin revisión previa)"
+prompt = f"""Read-only: modify nothing. Answer in Spanish, terse. No preamble.
+Validate the merged work of module {mod} so every task can end up correct and marked 'Hecha'. Module plan with acceptance criteria:\n{L.module_plan(done[0][0])}\n
+Tasks (task | deliverable | state | commit): {done}
+Previous review (may be outdated; re-check on HEAD):\n{prev}\n
+For each task inspect `git show --stat <sha>`, the relevant diffs and the code as it is now on HEAD. Judge against that task's acceptance criteria, and check relations with other modules touching the same code or contracts.
+Output per task exactly:
+## <TASK> — <VEREDICTO>   (LISTA | OBSERVACIONES | BLOQUEANTE)
+- 2-5 bullets of evidence with ruta:linea.
+If not LISTA add:
+### Corrección <TASK>
+A self-contained fix spec for a mid-tier coder on current HEAD: files and change per file, migration if any (next free number), tests and what they prove, out of scope, and the acceptance check that makes it LISTA. Minor nits go in one 'Menores (opcional)' line.
+End with '## Resumen {mod}' one paragraph."""
+out = L.ask(prompt, f"validate-{mod}")
+(L.R / f"{mod}.md").write_text(f"# Validación Opus de {mod}\n\n{out}\n")
+L.extract_corrections(out)
+print(mod, " ".join(f"{a}:{b}" for a, b in L.verdicts(out)))

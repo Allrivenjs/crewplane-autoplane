@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Revalidación Opus de correcciones ya fusionadas de un módulo.
+
+Uso: CORTEX_PLAN=<plan> .crewplane/bin/opus-revalidate <MÓDULO>
+Toma las tareas En validación que tienen revisiones/<plan>/correcciones/<TAREA>.md
+y las juzga contra su criterio y la corrección pedida. Resultado en v3/<MÓDULO>.md;
+una BLOQUEANTE deja su nueva corrección en correcciones/<TAREA>.md.
+"""
+import sys
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+L = SourceFileLoader("lib", str(Path(__file__).with_name("opus-review-lib.py"))).load_module()
+mod = sys.argv[1].upper()
+tasks = [(t, e, s) for t, e, st, s in L.rows(mod) if st == "En validación" and s and (L.R / "correcciones" / f"{t}.md").exists()]
+if not tasks:
+    raise SystemExit(f"{mod}: nada que revalidar")
+specs = "\n\n".join(f"=== Corrección pedida para {t} ===\n" + (L.R / "correcciones" / f"{t}.md").read_text() for t, _, _ in tasks)
+prompt = f"""Read-only: modify nothing. Answer in Spanish, terse. No preamble.
+Final re-validation of corrected tasks in module {mod}. Module plan with acceptance criteria:\n{L.module_plan(tasks[0][0])}\n
+Corrected tasks (task | deliverable | commit of the correction): {tasks}
+Correction that was requested for each:\n{specs}\n
+For each task inspect the correction commit and the code as it is now on HEAD. Judge whether it meets its acceptance criteria AND the requested correction. Ignore 'Menores (opcional)'.
+Output per task exactly:
+## <TASK> — <VEREDICTO>   (LISTA | BLOQUEANTE)
+- 2-4 bullets of evidence with ruta:linea.
+If BLOQUEANTE add '### Corrección <TASK>' with a self-contained fix spec. Use BLOQUEANTE only when the criterion or the requested correction is not met."""
+out = L.ask(prompt, f"revalidate-{mod}")
+(L.R / "v3" / f"{mod}.md").write_text(f"# Revalidación Opus de {mod}\n\n{out}\n")
+L.extract_corrections(out)
+print(mod, " ".join(f"{a}:{b}" for a, b in L.verdicts(out)))

@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Core temporal para medir sin tocar datos reales (nunca :8742, la base `cortex`
+# ni el token real). Compila el arbol indicado, crea una base propia
+# cortex_gate_orch_*, levanta el Core, indexa y mapea, corre tu comando y borra todo.
+#
+# Uso (desde tu worktree):
+#   /mnt/ssd500/projects/personal/cortex/.crewplane/bin/scratch-core [--src DIR] [--with extra-repo] [--no-index] -- <comando...>
+# El comando corre en DIR con CORTEX_SERVER, CORTEX_TOKEN=dev-token y CORTEX_BIN
+# (el CLI recien compilado) exportados. Ejemplos:
+#   scratch-core -- sh -c '$CORTEX_BIN eval weights --corpus eval/weights.json --project cortex'
+#   scratch-core -- sh -c 'curl -s -H "Authorization: Bearer $CORTEX_TOKEN" "$CORTEX_SERVER/api/v1/graph/query?pattern=sectors&project=cortex"'
+# Pega la salida literal en el contrato de la tarea.
+# --redis enciende el canal en vivo; el comando recibe ademas CORTEX_SCRATCH_DSN
+# (la base temporal, p. ej. para `cortex admin user create`) y CORTEX_SCRATCH_LOG.
+set -uo pipefail
+ROOT=/mnt/ssd500/projects/personal/cortex
+SRC=$PWD; WITH=(); INDEX=1; REDIS=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --src) SRC=$(cd "$2" && pwd); shift 2;;
+    --with) WITH+=("$2"); shift 2;;
+    --no-index) INDEX=0; shift;;
+    --redis) REDIS=redis://127.0.0.1:6380/9; shift;;  # canal en vivo (B07): Redis del compose, base 9
+    --) shift; break;;
+    *) break;;
+  esac
+done
+[ $# -gt 0 ] || { echo "uso: scratch-core [--src DIR] [--with extra-repo] -- <comando>"; exit 2; }
+TAG=$(printf '%s' "$SRC" | md5sum | cut -c1-8 | tr '0-9' 'g-p')  # sin digitos: el barrido de bases no la confunde con una tarea
+NAME="orch-$TAG-$$"
+PORT=$((20000 + RANDOM % 20000))
+BIN=$(mktemp -d)
+LOG="$BIN/core.log"
+rb() { CORTEX_PLAN=${CORTEX_PLAN:-mapa-cerebro} python3 -c "
+import sys; sys.argv=['rb']
+from importlib.machinery import SourceFileLoader
+rb=SourceFileLoader('rb','$ROOT/.crewplane/bin/run-board').load_module()
+$1"; }
+cleanup() {
+  [ -n "${CORE_PID:-}" ] && kill "$CORE_PID" 2>/dev/null
+  rb "rb.drop_gate_database('$NAME')" >/dev/null 2>&1
+  rm -rf "$BIN"
+}
+trap cleanup EXIT
+(cd "$SRC/core" && go build -o "$BIN/cortex-core" ./cmd/server && go build -o "$BIN/cortex" ./cmd/cortex) || { echo "scratch-core: no compila"; exit 1; }
+DSN=$(rb "rb.wait_for_database(); print(rb.fresh_gate_database('$NAME'))")
+[ -n "$DSN" ] || { echo "scratch-core: sin base temporal"; exit 1; }
+env -u CORTEX_TOKEN -u CORTEX_REDIS ${REDIS:+CORTEX_REDIS=$REDIS} CORTEX_TOKEN=dev-token CORTEX_RESOLVE_SECRET=scratch-core-secret-0123456789 CORTEX_DSN="$DSN" \
+  CORTEX_ADDR=127.0.0.1:$PORT CORTEX_DEV=1 "$BIN/cortex-core" > "$LOG" 2>&1 &
+CORE_PID=$!
+for i in $(seq 1 90); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 1; done
+export CORTEX_SERVER=http://127.0.0.1:$PORT CORTEX_TOKEN=dev-token CORTEX_BIN=$BIN/cortex CORTEX_SCRATCH_DSN=$DSN CORTEX_SCRATCH_LOG=$LOG
+echo "== scratch-core: $(curl -s http://127.0.0.1:$PORT/health) src=$SRC ($(git -C "$SRC" rev-parse --short HEAD 2>/dev/null)) $(date '+%F %H:%M')"
+if [ $INDEX = 1 ]; then
+  echo "== cortex index . --project cortex --apply"; (cd "$SRC" && "$CORTEX_BIN" index . --project cortex --apply 2>&1 | tail -3)
+  echo "== cortex map . --project cortex --apply";   (cd "$SRC" && "$CORTEX_BIN" map . --project cortex --apply 2>&1 | tail -2)
+  for w in "${WITH[@]}"; do
+    [ "$w" = extra-repo ] || continue
+    P="${SCRATCH_EXTRA_REPO:?set SCRATCH_EXTRA_REPO to the extra repository path}"
+    echo "== extra-repo: index + map (solo lectura del repo)"
+    (cd "$P" && "$CORTEX_BIN" index . --project "$(basename "$P")" --apply 2>&1 | tail -2 && "$CORTEX_BIN" map . --project "$(basename "$P")" --apply 2>&1 | tail -1)
+  done
+  echo "== respuestas 5xx del Core durante la carga: $(grep -c '"status":5' "$LOG")"
+fi
+(cd "$SRC" && "$@")

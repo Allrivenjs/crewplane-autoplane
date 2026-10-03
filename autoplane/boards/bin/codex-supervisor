@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Supervisor con Codex: cada INTERVALO segundos ejecuta un ciclo de supervision
+# siguiendo .agent/HANDOFF-CODEX.md. Uso: nohup .crewplane/bin/codex-supervisor >> .crewplane/supervisor.log 2>&1 &
+set -u
+cd "$(dirname "$0")/../.."
+INTERVALO="${INTERVALO:-900}"
+MODEL="${SUPERVISOR_MODEL:-gpt-6-sol}"
+echo "$(date '+%F %T') supervisor codex arrancado (modelo $MODEL, cada ${INTERVALO}s)"
+while true; do
+  echo "=== ciclo $(date '+%F %T') ==="
+  {
+    echo "You are the board supervisor. Follow crewplane-multi-agent-sandbox/.agent/HANDOFF-CODEX.md exactly (read it first, then .agent/CURRENT_STATE.md tail)."
+    echo "Do one supervision cycle now: run .crewplane/bin/board-status, relaunch dead boards for open modules, launch the next unblocked module if a module finished (max 4 boards), check Postgres, fix a Traceback if there is one (minimal change + tests + DECISIONS note), then append one status line to .agent/CURRENT_STATE.md."
+    echo "Never invoke claude. Use .crewplane/bin/with-repo-lock for any git commit. Answer in <=10 lines: what you saw, what you did."
+  } | timeout 1500 codex exec --model "$MODEL" -c model_reasoning_effort=medium --sandbox danger-full-access --skip-git-repo-check - 2>&1 | tail -n 40
+  echo "=== fin ciclo $(date '+%F %T'); duermo ${INTERVALO}s"
+  sleep "$INTERVALO"
+done

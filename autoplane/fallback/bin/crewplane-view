@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Post-mortem viewer for Crewplane runs.
+
+Reads the persisted artifacts. It does not need tmux, a live dashboard, or the
+crewplane process to still exist -- which is exactly when you want to look.
+
+  crewplane-view                  list runs, newest first
+  crewplane-view latest           timeline of the newest run
+  crewplane-view <run-id>         timeline of one run
+  crewplane-view latest <node>    full progress and output of one node
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+STAGES = Path(".crewplane/execution-stages")
+RESULTS = Path(".crewplane/execution-results")
+
+RESET = "\033[0m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+
+OUTCOME_COLOR = {
+    "valid": GREEN,
+    "quota": YELLOW,
+    "auth": YELLOW,
+    "cooling_down": CYAN,
+    "disabled": DIM,
+    "timeout": RED,
+    "provider_error": RED,
+    "permission_denied": YELLOW,
+}
+
+
+def paint(text: str, color: str) -> str:
+    return text if not sys.stdout.isatty() else f"{color}{text}{RESET}"
+
+
+def run_dirs() -> list[Path]:
+    if not STAGES.is_dir():
+        return []
+    # The directory name is "<workflow-slug>--<hash>-<YYYYMMDD-HHMMSS>", so
+    # sorting by name orders by workflow first. Order by the run id instead.
+    return sorted((p for p in STAGES.iterdir() if p.is_dir()),
+                  key=run_id, reverse=True)
+
+
+def run_id(run: Path) -> str:
+    return run.name[-15:]
+
+
+def resolve_run(token: str | None) -> Path | None:
+    runs = run_dirs()
+    if not runs:
+        return None
+    if token in (None, "latest"):
+        return runs[0]
+    for run in runs:
+        if run.name == token or run.name.endswith(token):
+            return run
+    return None
+
+
+def read_events(run: Path) -> list[dict]:
+    path = run / "logs/events.ndjson"
+    events = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    return events
+
+
+def node_log_lines(run: Path, node_id: str) -> list[str]:
+    lines: list[str] = []
+    for log in sorted((run / node_id).glob("logs/*/*.log")):
+        try:
+            lines.extend(log.read_text(encoding="utf-8", errors="replace").splitlines())
+        except OSError:
+            continue
+    return lines
+
+
+def fallback_chain(lines: list[str]) -> list[tuple[str, str, str]]:
+    """Extract (provider, outcome, timing) from the dispatcher's own lines."""
+    chain = []
+    for line in lines:
+        if "agent-fallback: " not in line or "(exit=" not in line:
+            continue
+        body = line.split("agent-fallback: ", 1)[1]
+        provider, _, rest = body.partition(": ")
+        outcome = rest.split(" (")[0]
+        timing = rest.split("(", 1)[1].rstrip(")") if "(" in rest else ""
+        chain.append((provider, outcome, timing))
+        continue
+    for line in lines:
+        if "en enfriamiento" in line and "agent-fallback: " in line:
+            body = line.split("agent-fallback: ", 1)[1]
+            provider = body.split(":", 1)[0]
+            if not any(entry[0] == provider for entry in chain):
+                chain.append((provider, "cooling_down", "omitido"))
+    return chain
+
+
+def progress_count(lines: list[str]) -> int:
+    return sum(1 for line in lines if "agent-fallback: " in line)
+
+
+def cmd_list() -> int:
+    runs = run_dirs()
+    if not runs:
+        print("Sin corridas en .crewplane/execution-stages")
+        return 1
+    for run in runs[:20]:
+        events = read_events(run)
+        started = next((e for e in events if e["event_type"] == "workflow_started"), None)
+        finished = [e for e in events if e["event_type"] == "invocation_finished"]
+        failed = [e for e in events if e["event_type"] == "node_failed"]
+        total_ms = sum(e.get("duration_ms", 0) for e in finished)
+        status = paint("fallo", RED) if failed else paint("ok", GREEN)
+        name = started.get("workflow_name", "?") if started else "?"
+        print(f"{run.name[-15:]}  {status:>14}  {len(finished)} invocaciones  "
+              f"{total_ms/1000:.1f}s  {paint(name, DIM)}")
+    return 0
+
+
+def cmd_timeline(run: Path) -> int:
+    events = read_events(run)
+    print(paint(f"Run {run.name}", BOLD))
+    order = []
+    for event in events:
+        node = event.get("node_id")
+        if node and node not in order:
+            order.append(node)
+    if not order:
+        print("Sin nodos registrados")
+        return 1
+    for node in order:
+        lines = node_log_lines(run, node)
+        chain = fallback_chain(lines)
+        finished = [e for e in events
+                    if e["event_type"] == "invocation_finished" and e.get("node_id") == node]
+        duration = sum(e.get("duration_ms", 0) for e in finished) / 1000
+        print(f"\n{paint(node, BOLD)}  {duration:.1f}s  "
+              f"{paint(f'{progress_count(lines)} eventos', DIM)}")
+        if not chain:
+            print(f"  {paint('sin lineas del dispatcher (invoker mock?)', DIM)}")
+        for provider, outcome, timing in chain:
+            color = OUTCOME_COLOR.get(outcome, "")
+            arrow = "  └─" if (provider, outcome, timing) == chain[-1] else "  ├─"
+            print(f"{arrow} {provider:<12} {paint(outcome, color):<22} {paint(timing, DIM)}")
+    print(f"\n{paint('detalle de un nodo:', DIM)} "
+          f"crewplane-view {run.name[-15:]} <nodo>")
+    return 0
+
+
+def cmd_node(run: Path, node_id: str) -> int:
+    matches = [p.name for p in run.iterdir() if p.is_dir() and node_id in p.name]
+    if not matches:
+        print(f"Nodo '{node_id}' no existe en {run.name}")
+        return 1
+    node = matches[0]
+    print(paint(f"{run.name} / {node}", BOLD))
+    print(paint("\n--- progreso ---", DIM))
+    for line in node_log_lines(run, node):
+        if "agent-fallback: " in line:
+            body = line.split("agent-fallback: ", 1)[1]
+            outcome = body.split(": ", 1)[1].split(" (")[0] if ": " in body else ""
+            print(f"  {paint(body, OUTCOME_COLOR.get(outcome, ''))}")
+    result = RESULTS / run.name / f"{node}-result.md"
+    if result.is_file():
+        print(paint(f"\n--- salida ({result}) ---", DIM))
+        print(result.read_text(encoding="utf-8", errors="replace").strip())
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if argv and argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if not argv:
+        return cmd_list()
+    run = resolve_run(argv[0])
+    if run is None:
+        print(f"No encuentro la corrida '{argv[0]}'")
+        return 1
+    if len(argv) >= 2:
+        return cmd_node(run, argv[1])
+    return cmd_timeline(run)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

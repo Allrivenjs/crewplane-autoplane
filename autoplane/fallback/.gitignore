@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.agent/logs/
+.crewplane/execution-stages/
+.crewplane/execution-results/
+.crewplane/preflight/

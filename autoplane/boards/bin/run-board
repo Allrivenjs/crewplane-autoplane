@@ -1,0 +1,2209 @@
+#!/usr/bin/env python3
+"""Run the Tencent Agent Memory board task by task through Crewplane.
+
+Each task gets its own Crewplane run in an isolated git worktree. Between tasks
+the runner enforces a gate, because an agent reporting success proves nothing:
+the worktree diff and the project's own test suite do.
+
+  run-board --dry-run              show the order without running anything
+  run-board --gate review          run one task, then stop for a human (default)
+  run-board --gate tests           keep going while each task shows a real diff
+                                   and `make test` passes inside its worktree
+  run-board --only M01             restrict to one module
+  run-board --group G1             restrict to one objective group (G1..G4)
+  run-board --limit 3              stop after N tasks
+  run-board --check-quota          which providers each role can use right now
+  run-board --adopt-last M01-03    finish a run that already happened: review, tests, merge
+  run-board --no-wait              stop instead of waiting for quota to reset
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import socket
+from urllib.parse import urlparse
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+_PLAN_NAME = os.environ.get("CORTEX_PLAN", "tencent-agent-memory")
+_PLAN_REL = f"docs/plans/{_PLAN_NAME}"
+PLANS = ROOT / _PLAN_REL
+BOARD = PLANS / "SEGUIMIENTO.md"
+REPORTS = ROOT / ".crewplane/board-runs"
+
+from importlib.machinery import SourceFileLoader
+
+# Objective groups and module order live in the generator, so the queue and the
+# workflow shape cannot drift apart.
+_GEN = SourceFileLoader("task_workflow", str(ROOT / ".crewplane/bin/task-workflow")).load_module()
+GROUPS = _GEN.GROUPS
+DEPENDS = _GEN.DEPENDS
+MODULE_ORDER = [m for _, (_, mods) in GROUPS.items() for m in mods]
+
+ROW = re.compile(r"^\|\s*\[(?P<id>[A-Z]\d{2}-\d{2})\]\([^)]+\)\s*\|"
+                 r"\s*(?P<entrega>[^|]+?)\s*\|\s*(?P<estado>[^|]+?)\s*\|")
+
+
+# «Corrección»: tarea ya fusionada que una validacion reabrio con una correccion
+# anotada en su plan (2026-09-29). Se ejecuta como Pendiente, pero no bloquea a
+# los modulos que dependen de ella: su codigo ya existe en HEAD.
+RUNNABLE = ("Pendiente", "Corrección")
+
+
+def board_tasks() -> list[tuple[str, str, str]]:
+    rows = []
+    for line in BOARD.read_text(encoding="utf-8").splitlines():
+        match = ROW.match(line)
+        if match:
+            rows.append((match.group("id"), match.group("entrega"), match.group("estado")))
+    return rows
+
+
+def ordered_pending(only: str | None, group: str | None = None) -> list[tuple[str, str, str]]:
+    """Pending tasks in execution order, with dependencies pulled forward.
+
+    A task waits for every module or task named in DEPENDS to leave Pendiente.
+    When a dependency is itself pending and part of the selection, it is placed
+    ahead (M12-01 runs before M06 even though M12 belongs to G4); when it is
+    pending but outside the selection, the dependent task is left out and the
+    caller can say why.
+    """
+    rows = [row for row in board_tasks() if row[2].strip() in RUNNABLE]
+    if only:
+        rows = [row for row in rows if row[0].startswith(only.upper())]
+    if group:
+        allowed = set(GROUPS[group.upper()][1])
+        rows = [row for row in rows if row[0].split("-")[0] in allowed]
+
+    def sort_key(row: tuple[str, str, str]) -> tuple[int, str]:
+        module = row[0].split("-")[0]
+        rank = MODULE_ORDER.index(module) if module in MODULE_ORDER else len(MODULE_ORDER)
+        return (rank, row[0])
+
+    selected = {row[0]: row for row in rows}
+    ordered: list[tuple[str, str, str]] = []
+    placed: set[str] = set()
+
+    def place(row: tuple[str, str, str], trail: tuple[str, ...] = ()) -> bool:
+        task_id = row[0]
+        if task_id in placed:
+            return True
+        if task_id in trail:
+            return False
+        for dep in unmet_dependencies(task_id):
+            dep_rows = [selected[t] for t in sorted(selected) if t == dep or t.startswith(dep + "-")]
+            if not dep_rows:
+                return False  # la dependencia sigue Pendiente y no esta en la seleccion
+            for dep_row in dep_rows:
+                if not place(dep_row, trail + (task_id,)):
+                    return False
+        placed.add(task_id)
+        ordered.append(row)
+        return True
+
+    for row in sorted(rows, key=sort_key):
+        place(row)
+    return ordered
+
+
+def unmet_dependencies(task_id: str) -> list[str]:
+    """Modules or tasks this task waits for that still have a Pendiente row."""
+    states = {row[0]: row[2].strip() for row in board_tasks()}
+    unmet = []
+    # Una tarea puede declarar las suyas (p. ej. "B07-01": []) y adelantarse a su
+    # modulo; sin clave propia hereda las del modulo.
+    for dep in DEPENDS.get(task_id, DEPENDS.get(task_id.split("-")[0], [])):
+        pending = [t for t, state in states.items()
+                   if (t == dep or t.startswith(dep + "-")) and state == "Pendiente" and t != task_id]
+        if pending:
+            unmet.append(dep)
+    return unmet
+
+
+def blocked_pending(only: str | None, group: str | None = None) -> list[tuple[str, list[str]]]:
+    """Selected tasks left out of the order, with the dependencies holding them."""
+    chosen = {row[0] for row in ordered_pending(only, group)}
+    rows = [row for row in board_tasks() if row[2].strip() in RUNNABLE]
+    if only:
+        rows = [row for row in rows if row[0].startswith(only.upper())]
+    if group:
+        allowed = set(GROUPS[group.upper()][1])
+        rows = [row for row in rows if row[0].split("-")[0] in allowed]
+    return [(row[0], unmet_dependencies(row[0])) for row in rows if row[0] not in chosen]
+
+
+BASE_COMMIT = "HEAD"
+
+
+def run(command: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(command, cwd=cwd or ROOT, text=True, capture_output=True)
+
+
+import contextlib
+import fcntl
+
+_REPO_LOCK = threading.RLock()
+_REPO_LOCK_DEPTH = 0
+_REPO_LOCK_FILE = None
+
+
+@contextlib.contextmanager
+def repo_lock():
+    """Serialize writes to the main checkout (index, HEAD, tablero, planes).
+
+    Several boards may run at once, one per module; two `git commit` in the
+    same checkout at the same time corrupt the index. One flock, re-entrant
+    inside a process, around every step that writes to the repository.
+    """
+    global _REPO_LOCK_DEPTH, _REPO_LOCK_FILE
+    with _REPO_LOCK:
+        if _REPO_LOCK_DEPTH == 0:
+            path = ROOT / ".crewplane/repo.lock"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _REPO_LOCK_FILE = path.open("w")
+            fcntl.flock(_REPO_LOCK_FILE, fcntl.LOCK_EX)
+        _REPO_LOCK_DEPTH += 1
+        try:
+            yield
+        finally:
+            _REPO_LOCK_DEPTH -= 1
+            if _REPO_LOCK_DEPTH == 0 and _REPO_LOCK_FILE is not None:
+                fcntl.flock(_REPO_LOCK_FILE, fcntl.LOCK_UN)
+                _REPO_LOCK_FILE.close()
+                _REPO_LOCK_FILE = None
+
+
+def latest_run_dir(task_id: str) -> Path | None:
+    """Newest run directory OF THIS TASK.
+
+    With boards running in parallel, two tasks can start in the same second;
+    the newest directory overall was another task's run, and on 2026-09-19 the
+    M12-01 board read M01-05's run (no exports yet) and declared "no changes".
+    """
+    stages = ROOT / ".crewplane/execution-stages"
+    if not stages.is_dir():
+        return None
+    prefix = f"tencent-{task_id.lower()}--"
+    runs = [d for d in stages.iterdir() if d.is_dir() and d.name.startswith(prefix)]
+    return max(runs, key=lambda d: d.name[-15:], default=None)
+
+
+def export_records(run: Path) -> list[dict]:
+    """Read Crewplane's own records of what each worktree produced.
+
+    Crewplane exports each fulfilled worktree to a branch and writes a record
+    naming the branch and the result commit. Scanning `git worktree list`
+    instead is unreliable: a run creates several checkouts (one per executor and
+    per reviewer round) and the reviewer's sits at the base commit with no
+    changes, so picking one at random reports "no work" for a task that worked.
+    """
+    exports = run / "workspace-exports"
+    if not exports.is_dir():
+        return []
+    records = []
+    for path in sorted(exports.glob("*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if record.get("status") == "fulfilled" and record.get("result_commit"):
+            records.append(record)
+    return records
+
+
+WORKSPACE_CACHE = Path.home() / ".cache/crewplane/workspaces"
+
+
+def salvage_candidates(run_key: str) -> list[tuple[str, str]]:
+    """Every checkout of a run that holds work, whatever Crewplane concluded.
+
+    A node is exported only when it succeeds, and "succeeded" depends on the
+    provider producing a closing message. An agent that edited files and then
+    ended its turn silently, timed out, or hit a quota wall is marked failed and
+    its checkout is discarded with the work inside. The worktree is the evidence;
+    the provider's summary is not. Uncommitted trees are skipped: a half-written
+    round is not a candidate.
+    """
+    found: list[tuple[str, str]] = []
+    if not WORKSPACE_CACHE.is_dir():
+        return found
+    for repo_dir in WORKSPACE_CACHE.iterdir():
+        run_dir = repo_dir / run_key
+        if not run_dir.is_dir():
+            continue
+        for checkout in sorted(run_dir.glob("*/checkout")):
+            if run(["git", "status", "--short"], cwd=checkout).stdout.strip():
+                continue
+            head = run(["git", "rev-parse", "HEAD"], cwd=checkout).stdout.strip()
+            if not head:
+                continue
+            ahead = run(["git", "rev-list", "--count", f"{BASE_COMMIT}..{head}"],
+                        cwd=checkout).stdout.strip()
+            if ahead.isdigit() and int(ahead) > 0:
+                found.append((head, worktree_label(checkout.parent.name)))
+    return found
+
+
+def worktree_label(directory: str) -> str:
+    """Map a checkout directory name back to its logical worktree."""
+    for logical in ("dev_agy_alt", "dev_agy", "dev_claude", "dev_codex", "task_worktree"):
+        if logical.replace("dev_", "") in directory or logical in directory:
+            return logical
+    return directory[:28]
+
+
+PLANS_DIR = PLANS / "planes"
+
+
+PLAN_POINTER = re.compile(r"(/[^\s`'\"]+/\.claude/plans/[^\s`'\")]+\.md)")
+
+
+def inline_plan_pointer(body: str) -> str:
+    """Replace a reference to Claude's plan file with the plan itself.
+
+    `--permission-mode plan` makes the CLI write its plan under ~/.claude/plans
+    and answer with the path. That path is outside the repository and outside the
+    worktrees, so handing it downstream passes a pointer where the plan belongs.
+    """
+    match = PLAN_POINTER.search(body)
+    if not match:
+        return body
+    path = Path(match.group(1))
+    try:
+        plan = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return body
+    if not plan:
+        return body
+    return f"{plan}\n\n---\n\nNota del orquestador: plan tomado de `{path}`, que el CLI escribio en modo plan.\n"
+
+
+SHELL_FENCE = re.compile(r"^```(bash|sh|shell|console|zsh)\s*$", re.MULTILINE)
+
+
+def defuse_commands(plan: str) -> str:
+    """Stop shell snippets in a plan from reading as orders to the implementer.
+
+    Antigravity treats a command it finds in the prompt as something to run, and
+    being refused aborts its whole attempt. The implementers never need to run
+    anything: the orchestrator runs `make test` against their result.
+    """
+    defused = SHELL_FENCE.sub("```text", plan)
+    if defused == plan:
+        return plan
+    return (defused + "\n\n---\n\nNota del orquestador: los bloques de comandos de este plan son "
+            "referencia para quien valide. No los ejecutes; la verificacion la corre el "
+            "orquestador con `make test` sobre tu resultado.\n")
+
+
+def save_plan(run: Path, task_id: str, entrega: str) -> Path | None:
+    """Persist the merged plan next to the board, outside the run artifacts.
+
+    Crewplane keeps node outputs under .crewplane/, which is disposable and not
+    in Git. Planning is the most expensive step of a task, so a crash or a failed
+    implementation should not force paying for it twice.
+    """
+    results = ROOT / ".crewplane/execution-results" / run.name
+    source = next((results / n for n in ("plan.thinker-result.md", "plan.merge-result.md")
+                   if (results / n).is_file()), None)
+    if source is None:
+        return None
+    body = source.read_text(encoding="utf-8", errors="replace")
+    marker = "## Output"
+    if marker in body:
+        body = body.split(marker, 1)[1].strip()
+    body = defuse_commands(inline_plan_pointer(body))
+    if not body:
+        return None
+    PLANS_DIR.mkdir(parents=True, exist_ok=True)
+    target = PLANS_DIR / f"{task_id}.md"
+    target.write_text(
+        f"# {task_id} — {entrega}\n\n"
+        f"Plan acordado por los pensadores en la corrida `{run.name[-15:]}`.\n"
+        f"Reutilizado en reintentos: mientras este archivo exista, la tarea no vuelve\n"
+        f"a pagar la fase de planificacion.\n\n"
+        f"{body}\n",
+        encoding="utf-8")
+    return target
+
+
+VERDICT = re.compile(r"^VEREDICTO\s+(?P<worktree>[A-Za-z0-9_]+)\s*:\s*(?P<verdict>APROBADO|RECHAZADO)(?P<reason>.*)$",
+                     re.MULTILINE)
+
+
+def crewplane_reviews(run: Path) -> list[Path]:
+    """Crewplane's own structured review records, oldest round first.
+
+    In an audit loop Crewplane injects its review contract (Major/Minor/Nitpicks
+    and `VERDICT: CHANGES_REQUESTED | NITS_ONLY | NO_FINDINGS`) and parses the
+    answer into <reviewer>.review.json with an `approved` flag. That file is the
+    authoritative outcome of the loop; our own VEREDICTO line is only a fallback
+    for workflows that do not run a review loop.
+    """
+    return sorted(run.glob("*/**/*.review.json"), key=lambda p: (str(p.parent), p.name))
+
+
+def major_issues(review_md: Path) -> str:
+    try:
+        body = review_md.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    match = re.search(r"## Major Issues\s*\n(.*?)(?:\n## |\n---|\Z)", body, re.S)
+    if not match:
+        return ""
+    lines = [l.strip() for l in match.group(1).splitlines() if l.strip() and l.strip() != "None"]
+    return " | ".join(lines[:3])[:400]
+
+
+def unstructured_approval(data: dict) -> bool:
+    """An approval Crewplane failed to parse because of prose before the review block.
+
+    Crewplane marks such a review `unstructured_feedback` with `approved: false`
+    even when it ends in `VERDICT: NO_FINDINGS` with no Major or Minor issues.
+    Seven approvals were lost that way (B06-03 on 2026-10-02 cost a full retry).
+    Accept it only when the text itself has an empty Major Issues section (and an
+    empty Minor one) and nothing is unresolved.
+    """
+    if data.get("evaluation_kind") != "unstructured_feedback" or data.get("unresolved_issue_count"):
+        return False
+    if data.get("original_verdict") not in ("NO_FINDINGS", "NITS_ONLY"):
+        return False
+    text = data.get("unstructured_feedback") or ""
+    def section(name: str) -> list[str] | None:
+        m = re.search(rf"## {name}\s*\n(.*?)(?:\n## |\nVERDICT|\Z)", text, re.S)
+        return None if m is None else [l.strip() for l in m.group(1).splitlines() if l.strip() and l.strip().lower() != "none"]
+    major, minor = section("Major Issues"), section("Minor Issues")
+    return major == [] and (minor is None or minor == [])
+
+
+def review_verdicts(run: Path) -> tuple[dict[str, str], int, str | None]:
+    """Candidates the reviewer refused, mapped to the reason it gave.
+
+    A review that cannot stop a merge is decoration. Tests answer "does it run";
+    only the reviewer answers "does it meet the acceptance criteria", so its
+    verdict has to be able to veto a candidate that passes the suite.
+    """
+    reviews = crewplane_reviews(run)
+    if reviews:
+        last = reviews[-1]
+        try:
+            data = json.loads(last.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}, 0, f"review.json ilegible: {last.name}"
+        verdict = data.get("normalized_verdict") or data.get("original_verdict") or "?"
+        if data.get("approved") is True or unstructured_approval(data):
+            return {}, 1, None
+        md = last.with_name(last.name.replace(".review.json", ".md"))
+        reason = major_issues(md) or f"{verdict} sin issues legibles"
+        pending = data.get("unresolved_issue_count")
+        if pending:
+            reason = f"{verdict}, {pending} issues sin resolver: {reason}"
+        return {"task_worktree": reason}, 1, None
+    results = ROOT / ".crewplane/execution-results" / run.name
+    body = ""
+    for path in sorted(results.glob("*-result.md")) if results.is_dir() else []:
+        body += "\n" + path.read_text(encoding="utf-8", errors="replace")
+    if not body.strip():
+        return {}, 0, "el nodo de revision no dejo salida"
+    # En un bucle de auditoria hay un veredicto por ronda: manda el ultimo.
+    last: dict[str, tuple[str, str]] = {}
+    parsed = 0
+    for match in VERDICT.finditer(body):
+        parsed += 1
+        last[match.group("worktree")] = (match.group("verdict"), match.group("reason"))
+    if parsed == 0:
+        return {}, 0, "la revision no emitio ninguna linea VEREDICTO reconocible"
+    rejected: dict[str, str] = {}
+    for worktree, (verdict, reason) in last.items():
+        if verdict != "RECHAZADO":
+            continue
+        reason = reason.strip(" —-:")
+        if not reason:
+            # El reviewer suele dejar el motivo en una vineta "**dev_x:** ..." antes
+            # de la linea de veredicto; recogerlo evita un "sin motivo" que no lo es.
+            bullet = re.search(r"\*\*" + re.escape(worktree) + r"[:*]+\s*(.+)", body)
+            reason = bullet.group(1).strip() if bullet else "ver la salida completa de la revision"
+        rejected[worktree] = reason
+    return rejected, parsed, None
+
+
+def record_review_findings(run: Path, task_id: str, vetoed: dict[str, str]) -> Path | None:
+    """Append the reviewer's findings to the task's saved plan.
+
+    A rejection that only stops the board wastes the review. Written into the
+    plan the executor reads, the same findings become the first thing the next
+    attempt fixes instead of something it has to rediscover.
+    """
+    plan = PLANS_DIR / f"{task_id}.md"
+    if not plan.is_file():
+        return None
+    results = ROOT / ".crewplane/execution-results" / run.name
+    detail = ""
+    for path in sorted(results.glob("*-result.md")) if results.is_dir() else []:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if "VEREDICTO" in text:
+            detail = text.split("## Output", 1)[-1].strip()
+    lines = [f"\n\n## Hallazgos de la revision anterior (corrida `{run.name[-15:]}`)\n",
+             "El reviewer rechazo el resultado. Corrige esto antes de ampliar nada:\n"]
+    for worktree, reason in vetoed.items():
+        lines.append(f"- **{worktree}:** {reason}")
+    if detail:
+        lines.append("\nRevision completa:\n\n" + defuse_commands(detail))
+    with plan.open("a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    return plan
+
+
+def _commit_plan_artifacts_unlocked(task_id: str, why: str) -> str | None:
+    """Commit planes/<task>.md so the next worktree can resolve it.
+
+    Worktrees materialize from the run base commit, so a plan (or review
+    findings) left uncommitted is invisible to the very executor it is meant to
+    guide. Only the plan file is staged: code merges go through merge_result.
+    """
+    plan = PLANS_DIR / f"{task_id}.md"
+    if not plan.is_file():
+        return None
+    if not run(["git", "status", "--short", str(plan)]).stdout.strip():
+        return None
+    run(["git", "add", str(plan)])
+    committed = run(["git", "commit", "-m", f"planes: {task_id} — {why}"])
+    if committed.returncode != 0:
+        return None
+    return run(["git", "rev-parse", "--short", "HEAD"]).stdout.strip()
+
+
+# --- disponibilidad de proveedores: esperar la cuota en vez de rendirse ---------
+
+SB = ROOT / "crewplane-multi-agent-sandbox"
+PROFILE_OF_ROLE = {"thinker": "read", "reviewer": "read", "coder": "write"}
+MAX_WAIT_SECONDS = 36 * 3600
+MAX_TASK_RETRIES = 6
+
+
+def role_providers(role: str) -> tuple[list[str], Path]:
+    """Enabled providers for a role, in fallback order, and the cooldown file."""
+    cfg = json.loads((SB / f"config/agent-fallback-cortex-{PROFILE_OF_ROLE[role]}.json").read_text())
+    order = [p for p in cfg["role_order"].get(role, []) if cfg["providers"].get(p, {}).get("enabled", True)]
+    return order, Path(cfg.get("cooldown_path", SB / ".agent/logs/cooldowns.json"))
+
+
+def cooldowns(path: Path) -> dict[str, float]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {k: float(v.get("until", 0)) for k, v in data.items() if isinstance(v, dict)}
+
+
+def role_availability(role: str, now: float | None = None) -> tuple[list[str], float | None]:
+    """Providers usable right now, and when the next cooling one frees up.
+
+    The dispatcher records a cooldown when a provider answers with a quota or
+    auth error. A role with every provider cooling has nobody to call; launching
+    the task anyway burns the other roles' work only to fail at this one.
+    """
+    now = time.time() if now is None else now
+    order, path = role_providers(role)
+    cooling = cooldowns(path)
+    free = [p for p in order if cooling.get(p, 0.0) <= now]
+    waits = [cooling[p] for p in order if cooling.get(p, 0.0) > now]
+    return free, (min(waits) if waits else None)
+
+
+def roles_needed(task_id: str) -> list[str]:
+    roles = ["coder", "reviewer"]
+    if not _GEN.saved_plan(task_id):
+        roles.insert(0, "thinker")
+    return roles
+
+
+def wait_for_providers(task_id: str, report: list[str], allow_wait: bool) -> bool:
+    """Block until every role the task needs has a provider, within the cap."""
+    waited = 0.0
+    while True:
+        blocked = [(r, until) for r in roles_needed(task_id)
+                   for free, until in [role_availability(r)] if not free]
+        if not blocked:
+            return True
+        if not allow_wait:
+            names = ", ".join(r for r, _ in blocked)
+            report.append(f"- {task_id}: sin proveedores para {names} y la espera esta desactivada")
+            print(f"{task_id}: sin proveedores para {names}. Usa --wait para esperar la cuota.")
+            return False
+        until = max(u for _, u in blocked if u) if any(u for _, u in blocked) else time.time() + 1800
+        delay = min(max(until - time.time() + 30, 60), 3600)
+        if waited + delay > MAX_WAIT_SECONDS:
+            report.append(f"- {task_id}: {waited/3600:.1f} h esperando cuota; se detiene")
+            print(f"{task_id}: mas de {MAX_WAIT_SECONDS//3600} h sin proveedores. Se detiene el tablero.")
+            return False
+        names = ", ".join(r for r, _ in blocked)
+        print(f"{task_id}: sin cuota para {names}; espero {delay/60:.0f} min "
+              f"(hasta {time.strftime('%H:%M', time.localtime(time.time() + delay))})", flush=True)
+        time.sleep(delay)
+        waited += delay
+
+
+QUOTA_EXHAUSTED = re.compile(r"todos los proveedores fallaron;.*=(quota|auth|cooling_down)")
+
+
+AGENT_COMMITTED = "detached HEAD does not match the recorded source commit"
+
+
+def run_status(run_dir: Path) -> str | None:
+    """Terminal status of a run, or None while it is still open.
+
+    Crewplane writes the summary only at the end, so a run without one is
+    either alive or died mid-way; run_is_live tells which.
+    """
+    summary = run_dir / "logs/summary.md"
+    try:
+        for line in summary.read_text(encoding="utf-8", errors="replace").splitlines():
+            text = line.strip().lstrip("-* ").strip()
+            if text.startswith("Status:"):
+                return text.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def run_is_live(run_dir: Path) -> int | None:
+    """Pid of the Crewplane process that owns this run, if still running."""
+    locks = ROOT / ".crewplane/locks"
+    if locks.is_dir():
+        for lock in locks.iterdir():
+            try:
+                owner = json.loads((lock / "owner.json").read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if owner.get("run_key_name") == run_dir.name and pid_alive(int(owner.get("pid", 0))):
+                return int(owner["pid"])
+    return None
+
+
+def run_progress(run_dir: Path) -> str:
+    """One line saying what a run is doing right now, so waiting never looks hung.
+
+    Reads the open invocation from the event log (role, round, elapsed) and how
+    long ago the provider last wrote to its log. A message that changes every
+    tick and names the active step is the difference between "waiting" and
+    "frozen" for whoever is watching the terminal.
+    """
+    open_inv = None
+    done = 0
+    try:
+        for line in (run_dir / "logs/events.ndjson").read_text(encoding="utf-8", errors="replace").splitlines():
+            e = json.loads(line)
+            if e.get("event_type") == "invocation_started":
+                open_inv = e
+            elif e.get("event_type") == "invocation_finished":
+                done += 1
+                open_inv = None
+    except (OSError, json.JSONDecodeError):
+        return "sin eventos legibles"
+    if open_inv is None:
+        return f"{done} invocaciones cerradas, cerrando la corrida"
+    started = open_inv.get("timestamp", "")
+    try:
+        t0 = time.mktime(time.strptime(started[:19], "%Y-%m-%dT%H:%M:%S")) - time.timezone
+        elapsed = int(time.time() - t0)
+    except (ValueError, TypeError):
+        elapsed = 0
+    role = open_inv.get("role", "?")
+    rnd = open_inv.get("round_num", "?")
+    log = Path(open_inv.get("log_file", "")) if open_inv.get("log_file") else None
+    age, last = "", ""
+    if log and log.is_file():
+        age = f", ultima salida hace {int(time.time() - log.stat().st_mtime)}s"
+        tail = [l for l in log.read_text(encoding="utf-8", errors="replace").splitlines()[-3:] if "agent-fallback:" in l]
+        if tail:
+            last = " · " + tail[-1].split("agent-fallback: ", 1)[-1][:60]
+    return f"{role} ronda {rnd}, {elapsed // 60} min{age}{last}"
+
+
+def rounds_completed(run_dir: Path) -> tuple[int, int]:
+    """(executor rounds finished, reviewer rounds finished) from the event log."""
+    exe = rev = 0
+    try:
+        for line in (run_dir / "logs/events.ndjson").read_text(encoding="utf-8", errors="replace").splitlines():
+            e = json.loads(line)
+            if e.get("event_type") != "invocation_finished":
+                continue
+            if e.get("role") == "executor":
+                exe += 1
+            elif e.get("role") == "reviewer":
+                rev += 1
+    except (OSError, json.JSONDecodeError):
+        pass
+    return exe, rev
+
+
+def bundle_candidates(run_dir: Path) -> list[tuple[str, str]]:
+    """Result commits Crewplane captured per round, imported from its bundles.
+
+    After each executor round Crewplane writes the round's result to a git
+    bundle under <node>/workspace-bundles/ and only later, on success, exports
+    a branch. A run that died mid-way leaves the bundles but no branch, and its
+    checkouts hold the *next* round's uncommitted edits, so the bundles are the
+    only clean, complete record of what each round finished. Fetching them into
+    the repository makes those commits addressable.
+    """
+    found: list[tuple[str, str]] = []
+    for bundle in sorted(run_dir.glob("*/workspace-bundles/*.bundle")):
+        heads = run(["git", "bundle", "list-heads", str(bundle)]).stdout.split()
+        if not heads:
+            continue
+        sha = heads[0]
+        if run(["git", "cat-file", "-e", f"{sha}^{{commit}}"]).returncode != 0:
+            fetched = run(["git", "fetch", "--quiet", str(bundle), heads[1] if len(heads) > 1 else "HEAD"])
+            if fetched.returncode != 0 or run(["git", "cat-file", "-e", f"{sha}^{{commit}}"]).returncode != 0:
+                continue
+        found.append((sha, worktree_label(bundle.stem) + ":" + (re.search(r"round\d+", bundle.stem) or re.search(r"$", "")).group(0)))
+    return found
+
+
+def newest_commit(candidates: list[tuple[str, str]]) -> str | None:
+    """The most advanced round of a run.
+
+    Order by commit time, then by the round number in the label (two rounds can
+    land in the same second in tests and in fast retries), and finally by
+    ancestry: a commit that descends from another is by definition later work.
+    """
+    def key(item: tuple[str, str]) -> tuple[int, int]:
+        sha, label = item
+        when = run(["git", "log", "-1", "--format=%ct", sha]).stdout.strip()
+        rnd = re.search(r"round(\d+)", label)
+        return (int(when) if when.isdigit() else 0, int(rnd.group(1)) if rnd else 0)
+    if not candidates:
+        return None
+    ordered = sorted(candidates, key=key)
+    best = ordered[-1][0]
+    for sha, _ in ordered[:-1]:
+        if run(["git", "merge-base", "--is-ancestor", best, sha]).returncode == 0 and sha != best:
+            best = sha  # alguien desciende del elegido: ese es mas nuevo
+    return best
+
+
+def snapshot_dirty_run(task_id: str, run_dir: Path) -> str | None:
+    """Pin the newest unfinished round of a run to `salvage/<TASK>-<run>`.
+
+    Before 2026-10-02 only clean checkouts counted, so every round cut short by a
+    dead provider or a reboot lost its uncommitted edits unless someone pinned
+    them by hand. Order: the `salvage/auto/*` branch agent-fallback left for this
+    run, else a snapshot of the newest dirty checkout (throwaway index, the
+    checkout itself is not touched).
+    """
+    stamp = run_dir.name[-15:]
+    branch = f"salvage/{task_id}-{stamp}"
+    autos = [b.strip() for b in run(["git", "branch", "--list", f"salvage/auto/*{run_dir.name}*",
+                                     "--sort=-committerdate", "--format=%(refname:short)"]).stdout.splitlines() if b.strip()]
+    if autos:
+        return branch if run(["git", "branch", "-f", branch, autos[0]]).returncode == 0 else autos[0]
+    checkouts = []
+    for repo_dir in WORKSPACE_CACHE.iterdir() if WORKSPACE_CACHE.is_dir() else []:
+        checkouts += [c for c in (repo_dir / run_dir.name).glob("*/checkout") if c.is_dir()]
+    for checkout in sorted(checkouts, key=lambda c: c.stat().st_mtime, reverse=True):
+        if not run(["git", "status", "--porcelain"], cwd=checkout).stdout.strip():
+            continue
+        index = REPORTS / f".{task_id}-{stamp}.idx"
+        REPORTS.mkdir(parents=True, exist_ok=True)
+        env = dict(os.environ, GIT_INDEX_FILE=str(index))
+        try:
+            ok = (subprocess.run(["git", "read-tree", "HEAD"], cwd=checkout, env=env, capture_output=True).returncode == 0 and
+                  subprocess.run(["git", "add", "-A", "."], cwd=checkout, env=env, capture_output=True).returncode == 0)
+            tree = subprocess.run(["git", "write-tree"], cwd=checkout, env=env, capture_output=True, text=True).stdout.strip() if ok else ""
+        finally:
+            index.unlink(missing_ok=True)
+        head = run(["git", "rev-parse", "HEAD"], cwd=checkout).stdout.strip()
+        if not tree or not head:
+            continue
+        sha = run(["git", "commit-tree", tree, "-p", head, "-m", f"{task_id}: ronda sin terminar ({stamp})"], cwd=checkout).stdout.strip()
+        if sha and run(["git", "branch", "-f", branch, sha]).returncode == 0:
+            return branch
+    return None
+
+
+def _checkpoint_task_unlocked(task_id: str, run_dir: Path, report: list[str]) -> str | None:
+    """Persist what an interrupted or failed attempt achieved, so nothing is lost.
+
+    The rounds already paid for live in Crewplane's checkouts and review files.
+    This pins the newest checkout that holds work to `salvage/<TASK>-<run>`,
+    writes what happened (rounds, last verdict, its Major Issues) into the task's
+    plan, and commits it: the next attempt starts informed and seeded instead
+    of from zero. Idempotent: a run is checkpointed once.
+    """
+    marker = run_dir / "checkpointed.txt"
+    if marker.is_file():
+        return marker.read_text(encoding="utf-8").strip() or None
+    stamp = run_dir.name[-15:]
+    branch = f"salvage/{task_id}-{stamp}"
+    # Bundles primero: son el resultado limpio de cada ronda. Los checkouts solo
+    # cuentan cuando no hay bundle y su arbol esta limpio.
+    commit = newest_commit(bundle_candidates(run_dir)) or newest_commit(salvage_candidates(run_dir.name))
+    if commit and run(["git", "rev-parse", "--verify", "-q", branch]).returncode != 0:
+        run(["git", "branch", branch, commit])
+    if not commit:
+        branch = salvage_agent_commit(task_id, run_dir) or ""
+    if not commit and not branch:
+        # Ronda cortada a medias (modelo caido, reinicio, proceso muerto): su trabajo
+        # sin commit esta en el checkout o en la rama que dejo agent-fallback.
+        branch = snapshot_dirty_run(task_id, run_dir) or ""
+    exe, rev = rounds_completed(run_dir)
+    vetoed, _, review_problem = review_verdicts(run_dir)
+    verdict = ("sin revision" if review_problem else
+               ("aprobado" if not vetoed else next(iter(vetoed.values()))))
+    plan = PLANS_DIR / f"{task_id}.md"
+    if plan.is_file() and (branch or exe or rev):
+        lines = [f"\n\n## Estado del intento anterior (corrida `{stamp}`)\n",
+                 f"Rondas completadas: ejecutor {exe}, reviewer {rev}. Ultima revision: {verdict}.\n"]
+        if branch:
+            base = run(["git", "merge-base", "HEAD", branch]).stdout.strip() or "HEAD"
+            stat = run(["git", "diff", "--stat", base, branch]).stdout.strip()
+            lines += [f"El trabajo de ese intento esta en la rama `{branch}`, visible desde tu worktree:\n",
+                      f"```text\ngit diff {base[:12]} {branch}\n```\n",
+                      "Continua desde el en lugar de empezar de cero: `git checkout " + branch +
+                      " -- <ruta>` trae archivos concretos sin mover HEAD. Contrasta cada archivo con los "
+                      "hallazgos de arriba antes de darlo por bueno. No lo fusiones tu; no hagas commit.\n",
+                      f"```text\n{stat}\n```"]
+        else:
+            lines.append("No quedo trabajo recuperable de ese intento.")
+        with plan.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        commit_plan_artifacts(task_id, f"estado del intento {stamp}")
+    marker.write_text(branch, encoding="utf-8")
+    if branch or exe or rev:
+        report.append(f"  - intento {stamp} conservado" + (f" en `{branch}`" if branch else " (sin trabajo recuperable)"))
+    return branch or None
+
+
+def pick_adoptable(runs: list[Path]) -> list[Path]:
+    """Order runs so the last element is the one worth adopting.
+
+    A live run outranks everything: it is the attempt actually producing work.
+    Then the newest finished run, then the newest dead one. Sorting by name
+    alone picked a killed duplicate over the live original on 2026-09-18.
+    """
+    live = [r for r in runs if run_is_live(r) is not None]
+    done = [r for r in runs if run_status(r) is not None and r not in live]
+    dead = [r for r in runs if r not in live and r not in done]
+    ordered = sorted(dead, key=lambda d: d.name[-15:]) + sorted(done, key=lambda d: d.name[-15:]) + live
+    return ordered
+
+
+def stale_runs(task_id: str) -> list[Path]:
+    """Runs of this task that never reached a terminal status and are not alive."""
+    stages = ROOT / ".crewplane/execution-stages"
+    if not stages.is_dir():
+        return []
+    prefix = f"tencent-{task_id.lower()}--"
+    return sorted((d for d in stages.iterdir()
+                   if d.name.startswith(prefix) and run_status(d) is None
+                   and run_is_live(d) is None and not (d / "checkpointed.txt").is_file()),
+                  key=lambda d: d.name[-15:])
+
+
+def failure_kind(run: Path | None) -> str | None:
+    """Classify why a Crewplane run died, when it is something we can act on.
+
+    "quota": every provider of some role was out of quota (wait, then retry).
+    "agent_committed": the executor ran `git commit` inside its worktree, which
+    Crewplane rejects at capture time and then deletes the checkout. The commit
+    still exists as a dangling object, so the work can be rescued.
+    """
+    if run is None:
+        return None
+    texts = []
+    for path in [run / "logs/summary.md", run / "logs/events.ndjson", *run.glob("*/logs/*/*.log")]:
+        try:
+            texts.append(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+    blob = "\n".join(texts)
+    if QUOTA_EXHAUSTED.search(blob):
+        return "quota"
+    if AGENT_COMMITTED in blob:
+        return "agent_committed"
+    return None
+
+
+def failed_for_quota(run: Path | None) -> bool:
+    return failure_kind(run) == "quota"
+
+
+def _salvage_agent_commit_unlocked(task_id: str, run_dir: Path) -> str | None:
+    """Rescue a commit the executor made inside a worktree Crewplane discarded.
+
+    Worktrees share the repository's object store, so the agent's commit
+    survives the checkout's deletion as an unreachable object. We pin it to a
+    salvage branch and tell the next attempt where it is: an hour of work the
+    executor can read from its own worktree instead of redoing.
+    """
+    stamp = run_dir.name[-15:]
+    branch = f"salvage/{task_id}-{stamp}"
+    if run(["git", "rev-parse", "--verify", "-q", branch]).returncode == 0:
+        return branch
+    listing = run(["git", "fsck", "--unreachable", "--no-reflogs"]).stdout
+    base = run(["git", "rev-parse", BASE_COMMIT]).stdout.strip()
+    best: tuple[int, str] | None = None
+    for line in listing.splitlines():
+        parts = line.split()
+        if len(parts) != 3 or parts[1] != "commit":
+            continue
+        sha = parts[2]
+        parent = run(["git", "rev-parse", "-q", "--verify", f"{sha}^"]).stdout.strip()
+        if parent != base:
+            continue
+        when = run(["git", "log", "-1", "--format=%ct", sha]).stdout.strip()
+        stamp_epoch = int(time.mktime(time.strptime(stamp, "%Y%m%d-%H%M%S")))
+        if when.isdigit() and int(when) >= stamp_epoch - 300 and (best is None or int(when) > best[0]):
+            best = (int(when), sha)
+    if best is None:
+        return None
+    sha = best[1]
+    if run(["git", "branch", branch, sha]).returncode != 0:
+        return None
+    stat = run(["git", "diff", "--stat", base, sha]).stdout.strip()
+    plan = PLANS_DIR / f"{task_id}.md"
+    if plan.is_file():
+        with plan.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"\n\n## Trabajo previo recuperado (corrida `{stamp}`)\n\n"
+                f"Un intento anterior implemento parte de la tarea pero hizo `git commit` dentro del "
+                f"worktree, cosa que el orquestador no admite. Ese trabajo esta en la rama `{branch}`, "
+                f"visible desde tu worktree:\n\n```text\ngit diff {base[:12]} {branch}\n"
+                f"git show {branch} --stat\n```\n\nPuedes partir de el (`git checkout {branch} -- <ruta>` "
+                f"trae archivos concretos sin mover HEAD), revisandolo contra los hallazgos de arriba: no fue "
+                f"revisado ni probado. No lo fusiones tu; no hagas commit.\n\n```text\n{stat}\n```\n")
+        commit_plan_artifacts(task_id, f"trabajo previo recuperado en {branch}")
+    return branch
+
+
+SCAFFOLD = re.compile(r"(^|/)(salvage\.patch|patch_[^/]*\.(py|go|sh)|PROBE_[^/]*)$|\.patch$|^[^/]+\.(py|go|sh|txt|log|diff)$")
+
+
+def is_scaffold(path: str) -> bool:
+    """Files an agent leaves behind as tooling, never part of the deliverable."""
+    return bool(SCAFFOLD.search(path))
+
+
+def scaffold_files(commit: str) -> list[str]:
+    """Added files in a candidate that look like the agent's own scratch work.
+
+    Round 1 of M01-03 (2026-09-18) left `salvage.patch` and seven `patch_*.py`
+    helpers at the repository root; an approved round would have merged them.
+    """
+    status = run(["git", "diff", "--name-status", BASE_COMMIT, commit]).stdout
+    added = [line.split("\t", 1)[1] for line in status.splitlines()
+             if line.startswith("A\t")]
+    return [path for path in added if is_scaffold(path)]
+
+
+def _mark_board_unlocked(task_id: str, estado: str, evidencia: str) -> bool:
+    """Update the task's row on the board after a merge.
+
+    Agents may not touch SEGUIMIENTO.md, but the orchestrator must: the queue
+    reads `Pendiente` from it, so a merged task left as Pendiente would be run
+    again. `En validacion` with the commit as evidence is the board's own
+    convention; a person promotes it to `Hecha` after looking at the diff.
+    """
+    text = BOARD.read_text(encoding="utf-8")
+    pattern = re.compile(r"^(\|\s*\[" + re.escape(task_id) + r"\]\([^)]+\)\s*\|\s*[^|]+?\s*\|)\s*[^|]+?\s*\|\s*[^|]*?\s*\|\s*[^|]*?\s*\|\s*$",
+                         re.MULTILINE)
+    match = pattern.search(text)
+    if not match:
+        return False
+    row = f"{match.group(1)} {estado} | Orquestador multiagente | {evidencia} |"
+    BOARD.write_text(text[:match.start()] + row + text[match.end():], encoding="utf-8")
+    run(["git", "add", str(BOARD)])
+    committed = run(["git", "commit", "-m", f"tablero: {task_id} {estado.lower()} ({evidencia})"])
+    return committed.returncode == 0
+
+
+def commit_evidence(commit: str) -> tuple[str, bool]:
+    """Diff the exported result against the branch we are building on."""
+    stat = run(["git", "diff", "--stat", BASE_COMMIT, commit]).stdout.strip()
+    return stat, bool(stat)
+
+
+def _merge_result_unlocked(commit: str, task_id: str, entrega: str) -> tuple[bool, str]:
+    """Bring an exported result commit onto the current branch as one commit.
+
+    Every run's worktree is materialized from the run base commit and Crewplane
+    never merges, so without this step each task would build on a Cortex that
+    lacks the previous ones. The same application ran already in the gate
+    worktree: what got tested is what gets committed.
+    """
+    ok, detail = apply_candidate(commit, task_id, ROOT)
+    if not ok:
+        return False, detail
+    committed = run(["git", "commit", "-m", f"{task_id}: {entrega}"])
+    if committed.returncode != 0:
+        return False, (committed.stderr.strip() or committed.stdout.strip())[:300]
+    return True, run(["git", "rev-parse", "--short", "HEAD"]).stdout.strip()
+
+
+CANDIDATE_EXCLUDES = (f":(exclude){_PLAN_REL}/planes", f":(exclude){_PLAN_REL}/SEGUIMIENTO.md",
+                      ":(exclude)**/node_modules", ":(exclude)node_modules")
+
+
+def apply_candidate(commit: str, task_id: str, cwd: Path) -> tuple[bool, str]:
+    """Stage the candidate's changes onto the checkout at `cwd` (HEAD), renumbering migrations.
+
+    Used twice per task: in the gate worktree (so `make test` judges the tree
+    that will actually land, not the candidate's snapshot of an older HEAD) and
+    in the main checkout for the real merge. On 2026-09-20 M06-03 was approved
+    and rejected by the gate for two `0022_*` migrations that were already
+    fixed on HEAD: the snapshot was stale, the merge would have been fine.
+    """
+    # El commit exportado nace del commit base de SU corrida; las rondas
+    # encadenan sus commits, asi que el ancestro comun con HEAD es la base.
+    base = run(["git", "merge-base", "HEAD", commit], cwd=cwd).stdout.strip() or BASE_COMMIT
+    # Planes, tablero y node_modules son del orquestador: fuera del parche.
+    patch = run(["git", "diff", "--binary", base, commit, "--", ".", *CANDIDATE_EXCLUDES], cwd=cwd)
+    if patch.returncode != 0:
+        return False, patch.stderr.strip()
+    if not patch.stdout.strip():
+        return False, "el commit exportado no difiere del commit base"
+    patch_file = REPORTS / f"{task_id}.patch"
+    patch_file.parent.mkdir(parents=True, exist_ok=True)
+    patch_file.write_text(patch.stdout, encoding="utf-8")
+
+    # --index deja en el indice exactamente lo que trae el parche (un `git add
+    # -A` arrastraba lo sin rastrear y fallaba con el repo anidado).
+    check = run(["git", "apply", "--check", str(patch_file)], cwd=cwd)
+    if check.returncode == 0:
+        applied = run(["git", "apply", "--index", str(patch_file)], cwd=cwd)
+    else:
+        # HEAD avanzo desde la base: a tres bandas con los blobs del candidato.
+        # Con conflicto real se restaura todo y la tarea se reintenta.
+        applied = run(["git", "apply", "--3way", "--index", str(patch_file)], cwd=cwd)
+        if applied.returncode != 0 and CONFLICT_RESOLVER is not None:
+            resolved = CONFLICT_RESOLVER(cwd, task_id)
+            if resolved:
+                print(f"{task_id}: conflictos resueltos por el coder en {', '.join(resolved)}", flush=True)
+                applied = subprocess.CompletedProcess(applied.args, 0, "", "")
+        if applied.returncode != 0:
+            touched = [line.split("\t")[-1] for line in
+                       run(["git", "apply", "--numstat", str(patch_file)], cwd=cwd).stdout.splitlines() if line.strip()]
+            tracked = set(run(["git", "ls-tree", "-r", "--name-only", "HEAD", "--", *touched], cwd=cwd).stdout.split()) if touched else set()
+            run(["git", "reset", "-q", "--", *touched], cwd=cwd) if touched else None
+            if tracked:
+                run(["git", "checkout", "HEAD", "--", *sorted(tracked)], cwd=cwd)
+            for path in touched:
+                target = cwd / path
+                if path not in tracked and (target.is_symlink() or target.is_file()):
+                    target.unlink(missing_ok=True)  # nunca un directorio real
+            relevant = [l for l in applied.stderr.splitlines() if re.search(r"conflict|error|failed", l, re.I) and "cleanly" not in l]
+            return False, "conflicto: " + ("; ".join(relevant[-3:]) if relevant else "el parche no aplica sobre el HEAD actual")
+    if applied.returncode != 0:
+        return False, applied.stderr.strip()
+    for old_name, new_name in renumber_new_migrations(base, commit, cwd):
+        print(f"{task_id}: migracion {old_name} renumerada a {new_name} (el numero ya existia en HEAD)", flush=True)
+    return True, ""
+
+
+CONFLICT_MARKERS = re.compile(r"^(<<<<<<<|=======|>>>>>>>)", re.M)
+
+
+def resolve_conflicts_with_coder(cwd: Path, task_id: str) -> list[str] | None:
+    """Ask the cheap coder to resolve the conflict markers `git apply --3way` left.
+
+    Four boards touch the same route tables and permission tests; a mechanical
+    three-way merge fails on adjacent hunks every hour. The resolver runs in
+    the gate worktree, so what it produces is exactly what gets tested and
+    fast-forwarded. Returns the files it fixed, or None if markers remain.
+    """
+    unmerged = run(["git", "diff", "--name-only", "--diff-filter=U"], cwd=cwd).stdout.split()
+    if not unmerged:
+        return None
+    prompt = (
+        "Resolve the git merge conflict markers (<<<<<<<, =======, >>>>>>>) in these files: "
+        + ", ".join(unmerged) + ". Both sides are wanted: keep the changes from HEAD and the incoming "
+        "ones, combining them (e.g. both new routes, both new test cases). Do not remove or rewrite "
+        "anything outside the conflicted regions. Do not run git commands other than `git diff`. "
+        "After editing, run `cd core && gofmt -l . && go build ./...` and fix compile errors in those files only. "
+        "Reply with the list of files you resolved."
+    )
+    try:
+        subprocess.run([str(SB / "bin/agent-fallback"), "--role", "coder", "--config",
+                        str(SB / "config/agent-fallback-cortex-write.json")],
+                       cwd=cwd, input=prompt, text=True, capture_output=True, timeout=900)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for path in unmerged:
+        target = cwd / path
+        if not target.is_file() or CONFLICT_MARKERS.search(target.read_text(encoding="utf-8", errors="replace")):
+            return None
+    run(["git", "add", "--", *unmerged], cwd=cwd)
+    return unmerged
+
+
+CONFLICT_RESOLVER = resolve_conflicts_with_coder
+
+
+MIGRATIONS_DIR = "core/internal/store/migrations"
+MIGRATION_NUMBER = re.compile(r"^(\d{4})_")
+
+
+def renumber_new_migrations(base: str, commit: str, cwd: Path | None = None) -> list[tuple[str, str]]:
+    """Give incoming migrations a free number when HEAD already used theirs.
+
+    Modules run in parallel and each one names its migration with the next
+    number it sees in its own worktree; merged, two files share a number and
+    `TestMigrationFilenames` rejects the tree (M11-04 vs M03-0x, 2026-09-20).
+    Works on the index right after `git apply --index`, before the commit:
+    the file is moved and every staged file that names it is rewritten.
+    """
+    cwd = cwd or ROOT
+    added = [line for line in run(["git", "diff", "--name-only", "--diff-filter=A", base, commit, "--", MIGRATIONS_DIR], cwd=cwd).stdout.split()
+             if MIGRATION_NUMBER.match(Path(line).name)]
+    if not added:
+        return []
+    head_files = run(["git", "ls-tree", "--name-only", f"HEAD:{MIGRATIONS_DIR}"], cwd=cwd).stdout.split()
+    taken = {int(MIGRATION_NUMBER.match(f).group(1)): f for f in head_files if MIGRATION_NUMBER.match(f)}
+    highest = max([*taken, *(int(MIGRATION_NUMBER.match(Path(a).name).group(1)) for a in added)], default=0)
+    renamed: list[tuple[str, str]] = []
+    staged = run(["git", "diff", "--cached", "--name-only"], cwd=cwd).stdout.split()
+    for path in sorted(added):
+        name = Path(path).name
+        number = int(MIGRATION_NUMBER.match(name).group(1))
+        if taken.get(number) in (None, name):
+            taken[number] = name
+            continue
+        highest += 1
+        new_name = f"{highest:04d}_{name.split('_', 1)[1]}"
+        new_path = f"{MIGRATIONS_DIR}/{new_name}"
+        run(["git", "mv", "-f", path, new_path], cwd=cwd)
+        taken[highest] = new_name
+        for other in staged:
+            target = cwd / other
+            if not target.is_file() or other == path:
+                continue
+            try:
+                text = target.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if name in text:
+                target.write_text(text.replace(name, new_name), encoding="utf-8")
+                run(["git", "add", "--", other], cwd=cwd)
+        renamed.append((name, new_name))
+    return renamed
+
+
+# --- fugas al repositorio principal --------------------------------------------
+#
+# El ejecutor trabaja en un worktree, pero `git worktree list` y el archivo .git
+# del checkout le muestran donde vive el repositorio principal. El 2026-09-19,
+# en la ronda 3 del ciclo 2 de M01-03, Antigravity edito 44 archivos alli en vez
+# de en su worktree: la ronda quedo vacia, el arbol principal sucio, y el
+# siguiente intento murio en el preflight de Crewplane ("tracked files have
+# staged or unstaged changes"). Detectarlo exige una foto del arbol antes y
+# despues de cada corrida; el trabajo fugado se conserva en una rama y el arbol
+# vuelve a quedar limpio sin intervencion.
+
+
+def tree_snapshot() -> dict[str, str]:
+    """Rutas modificadas o sin rastrear del repo principal con el hash de su contenido."""
+    out = run(["git", "status", "--porcelain=v1", "--untracked-files=all", "-z"]).stdout
+    entries = out.split("\0")
+    snapshot: dict[str, str] = {}
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        status, path = entry[:2], entry[3:]
+        if status[0] in "RC":
+            index += 1  # la ruta de origen va en la entrada siguiente
+        target = ROOT / path
+        if target.is_file():
+            digest = run(["git", "hash-object", "--", path]).stdout.strip() or "?"
+        else:
+            digest = "borrado"
+        snapshot[path] = f"{'?' if status == '??' else 'M'}:{digest}"
+    return snapshot
+
+
+def leaked_paths(before: dict[str, str], after: dict[str, str]) -> list[str]:
+    """Rutas del proyecto que cambiaron en el repo principal mientras corria un agente."""
+    return sorted(path for path, state in after.items()
+                  if before.get(path) != state and belongs_to_project(path, state))
+
+
+# Directorios que escriben el orquestador y Crewplane durante una corrida, y la
+# configuracion local de la persona: cambian a cada minuto y nunca son una fuga.
+# El 2026-09-19 la primera version aparto el propio board.log y los eventos de la
+# corrida como si un agente los hubiera dejado.
+ORCHESTRATOR_DIRS = (".crewplane/", "crewplane-multi-agent-sandbox/", ".claude/")
+PLAN_PREFIX = f"{_PLAN_REL}/planes/"
+
+
+def belongs_to_project(path: str, state: str) -> bool:
+    """Un archivo rastreado con cambios, o uno nuevo dentro del arbol del proyecto.
+
+    Un archivo sin rastrear cuenta solo si vive bajo un directorio que HEAD ya
+    conoce (core/, docs/...) o es un andamio en la raiz: lo que una persona
+    tenga aparte (TencentDB-Agent-Memory/, notas propias) no es asunto del tablero.
+    """
+    if path.startswith(ORCHESTRATOR_DIRS):
+        return False
+    # planes/<TAREA>.md nuevos los escribe el orquestador (o Opus por adelantado,
+    # 2026-09-29); los ejecutores tienen prohibido tocarlos. Sin rastrear no son fuga.
+    if state.startswith("?") and path.startswith(PLAN_PREFIX):
+        return False
+    if not state.startswith("?"):
+        return True
+    if is_scaffold(path):
+        return True
+    top = path.split("/", 1)[0]
+    return "/" in path and top in tracked_top_level()
+
+
+_TRACKED_TOP: set[str] | None = None
+
+
+def tracked_top_level() -> set[str]:
+    global _TRACKED_TOP
+    if _TRACKED_TOP is None:
+        _TRACKED_TOP = set(run(["git", "ls-tree", "--name-only", "HEAD"]).stdout.split())
+    return _TRACKED_TOP
+
+
+def _quarantine_leak_unlocked(task_id: str, paths: list[str], report: list[str], why: str) -> str | None:
+    """Mover cambios ajenos del arbol principal a `salvage/<TAREA>-fuga-<sello>` y limpiarlo.
+
+    El commit se construye con un indice temporal para no tocar el indice real
+    ni el HEAD de la rama. Despues los archivos rastreados vuelven a HEAD y los
+    nuevos se borran: el contenido sigue en la rama, referenciado desde el plan.
+    """
+    paths = [p for p in paths if (ROOT / p).is_file() or not (ROOT / p).exists()]
+    # Volver a mirar bajo el cerrojo: una foto tomada mientras otro tablero
+    # avanzaba HEAD ve archivos "modificados" que un instante despues estan
+    # limpios (M04-03, 2026-09-20 11:02, rama vacia).
+    still_dirty = set()
+    for line in run(["git", "status", "--porcelain=v1", "--untracked-files=all", "-z", "--", *paths]).stdout.split("\0"):
+        if len(line) >= 4:
+            still_dirty.add(line[3:])
+    paths = [p for p in paths if p in still_dirty]
+    if not paths:
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    branch = f"salvage/{task_id}-fuga-{stamp}"
+    import tempfile
+    handle, index_name = tempfile.mkstemp(prefix="leak-index-")
+    os.close(handle)
+    index_file = Path(index_name)
+    index_file.unlink(missing_ok=True)  # git quiere crear el indice el mismo
+    env = dict(os.environ, GIT_INDEX_FILE=str(index_file))
+    git = lambda *args: subprocess.run(["git", *args], cwd=ROOT, text=True, capture_output=True, env=env)
+    try:
+        git("read-tree", "HEAD")
+        git("add", "-A", "--", *paths)
+        tree = git("write-tree").stdout.strip()
+        commit = git("commit-tree", tree, "-p", "HEAD", "-m",
+                     f"{task_id}: cambios dejados fuera del worktree ({why})").stdout.strip()
+    finally:
+        index_file.unlink(missing_ok=True)
+    if not commit:
+        return None
+    run(["git", "branch", branch, commit])
+    tracked = set(run(["git", "ls-files", "-z", "--", *paths]).stdout.split("\0")) - {""}
+    if tracked:
+        run(["git", "checkout", "HEAD", "--", *sorted(tracked)])
+    for path in paths:
+        if path not in tracked:
+            (ROOT / path).unlink(missing_ok=True)
+    stat = run(["git", "diff", "--stat", "HEAD", branch]).stdout.strip()
+    plan = PLANS_DIR / f"{task_id}.md"
+    if plan.is_file():
+        with plan.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"\n\n## Cambios dejados fuera del worktree ({why}, `{stamp}`)\n\n"
+                f"Un intento anterior edito el repositorio principal en lugar de su worktree. "
+                f"Ese trabajo esta en la rama `{branch}`; revisalo con `git diff HEAD {branch}` "
+                f"y trae con `git checkout {branch} -- <ruta>` solo lo que sirva. "
+                f"Trabaja unicamente dentro del directorio actual.\n\n```text\n{stat}\n```\n")
+        commit_plan_artifacts(task_id, f"cambios fuera del worktree {stamp}")
+    report.append(f"  - {len(paths)} archivos fuera del worktree ({why}) conservados en `{branch}`")
+    return branch
+
+
+def scaffold_strays(snapshot: dict[str, str]) -> list[str]:
+    """Lo que bloquea el preflight o delata a un agente: rastreados sucios y andamios."""
+    return sorted(path for path, state in snapshot.items()
+                  if belongs_to_project(path, state)
+                  and (not state.startswith("?") or is_scaffold(path)))
+
+
+BOARDS = ROOT / ".crewplane/boards"
+
+
+def board_scope(only: str | None, group: str | None) -> str:
+    if only:
+        return f"only-{only.upper()}"
+    if group:
+        return f"group-{group.upper()}"
+    return "all"
+
+
+def scope_modules(scope: str) -> set[str]:
+    if scope.startswith("only-"):
+        prefix = scope[5:]
+        module = prefix.split("-")[0]
+        return {m for m in MODULE_ORDER if m.startswith(module)} or {module}
+    if scope.startswith("group-"):
+        return set(GROUPS[scope[6:]][1])
+    return set(MODULE_ORDER)
+
+
+def board_lock_path(scope: str) -> Path:
+    return BOARDS / f"{scope}.pid"
+
+
+def live_boards() -> list[tuple[str, int]]:
+    """(scope, pid) of every board whose process is alive, old-style lock included."""
+    found = []
+    candidates = list(BOARDS.glob("*.pid")) if BOARDS.is_dir() else []
+    legacy = ROOT / ".crewplane/board.pid"
+    if legacy.is_file():
+        candidates.append(legacy)
+    for path in candidates:
+        try:
+            pid = int(path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        if pid != os.getpid() and pid_alive(pid):
+            found.append(("all" if path == legacy else path.stem, pid))
+    return found
+
+
+def overlapping_board(scope: str) -> tuple[str, int] | None:
+    """A live board whose modules intersect this scope's, if any.
+
+    Boards on disjoint modules (M03 and M06) may run side by side; `all`
+    overlaps everything.
+    """
+    mine = scope_tasks(scope)
+    for other_scope, pid in live_boards():
+        if mine & scope_tasks(other_scope):
+            return other_scope, pid
+    return None
+
+
+def scope_tasks(scope: str) -> set[str]:
+    """Task ids a board scope covers: `only-B04-04` is one task, `only-B04` the module.
+
+    Overlap is by task, not module (2026-09-30): one board per task lets the
+    independent tasks of a module run side by side, while a module board still
+    excludes a task board inside it.
+    """
+    if scope.startswith("only-") and re.fullmatch(r"[A-Z]\d{2}-\d{2}", scope[5:]):
+        return {scope[5:]}
+    modules = scope_modules(scope)
+    tasks = {row[0] for row in board_tasks() if row[0].split("-")[0] in modules}
+    return tasks or {f"{m}-*" for m in modules}
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def clear_stale_locks() -> None:
+    """Remove Crewplane locks whose owning process is gone.
+
+    Each lock records the pid that took it, so this never touches a lock held
+    by a live run: two boards launched by mistake keep excluding each other,
+    and a lock left by a killed run stops blocking the next launch.
+    """
+    locks = ROOT / ".crewplane/locks"
+    if not locks.is_dir():
+        return
+    removed = 0
+    for lock in locks.iterdir():
+        owner = lock / "owner.json"
+        try:
+            pid = int(json.loads(owner.read_text(encoding="utf-8")).get("pid", 0))
+        except (OSError, ValueError, json.JSONDecodeError):
+            pid = 0
+        if pid and pid_alive(pid):
+            continue
+        subprocess.run(["rm", "-rf", str(lock)])
+        removed += 1
+    if removed:
+        print(f"{removed} cerrojo(s) de corridas muertas eliminados", flush=True)
+
+
+def run_task(task_id: str, entrega: str, report: list[str], gate: str, merge: bool,
+             allow_wait: bool = True, attempt: int = 1) -> bool:
+    """Run one task. Return True to continue with the next one."""
+    global BASE_COMMIT
+    print(f"\n=== {task_id} ===" + (f" (intento {attempt})" if attempt > 1 else ""), flush=True)
+    if not wait_for_providers(task_id, report, allow_wait):
+        return False
+    clear_stale_locks()
+    latest = sorted((d for d in (ROOT / ".crewplane/execution-stages").glob(f"tencent-{task_id.lower()}--*")),
+                    key=lambda d: d.name[-15:])
+    if latest and not (latest[-1] / "checkpointed.txt").is_file() and run_is_live(latest[-1]) is None \
+            and run_status(latest[-1]) is not None:
+        # La tarea sigue Pendiente y su ultima corrida termino sin fusionar: sus
+        # rondas valen. Conservarlas antes de relanzar, igual que las interrumpidas.
+        kept = checkpoint_task(task_id, latest[-1], report)
+        if kept:
+            print(f"{task_id}: ultima corrida {latest[-1].name[-15:]} conservada en {kept}", flush=True)
+    dead_runs = stale_runs(task_id)
+    for older in dead_runs[:-1]:
+        # Corridas antiguas sin cierre (Ctrl-C de otros dias): marcarlas sin
+        # crear ramas ni notas; solo la ultima merece conservarse.
+        (older / "checkpointed.txt").write_text("", encoding="utf-8")
+    for dead in dead_runs[-1:]:
+        # Un intento interrumpido (Ctrl-C, caida, kill) deja rondas ya pagadas en
+        # disco. Conservarlas antes de relanzar es lo que hace que el siguiente
+        # intento continue por donde iba.
+        kept = checkpoint_task(task_id, dead, report)
+        print(f"{task_id}: intento interrumpido {dead.name[-15:]} conservado"
+              + (f" en {kept}" if kept else ""), flush=True)
+    if commit_plan_artifacts(task_id, "artefactos pendientes de una sesion anterior"):
+        BASE_COMMIT = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+        print(f"{task_id}: plan pendiente committeado para que el worktree lo vea")
+    with repo_lock():  # nunca mirar el arbol mientras otro tablero fusiona
+        strays = scaffold_strays(tree_snapshot())
+    if strays:
+        # Archivos rastreados con cambios tumban el preflight de Crewplane, y
+        # un andamio en la raiz solo lo deja un agente. Conservar y limpiar.
+        kept = quarantine_leak(task_id, strays, report, "arbol sucio al arrancar")
+        BASE_COMMIT = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+        print(f"{task_id}: {len(strays)} archivos con cambios fuera de un worktree"
+              + (f"; conservados en {kept} y arbol restaurado" if kept else ""), flush=True)
+    # The reviewer needs the base: from round 2 on Crewplane hands it the
+    # earlier rounds as commits, `git status` is clean, and a reviewer that
+    # only looks at the uncommitted diff rejects real work (B01-01, B02-01,
+    # 2026-09-30: six rejections of 400-line diffs "because the worktree is clean").
+    task_base = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+    generated = run([str(ROOT / ".crewplane/bin/task-workflow"), task_id, task_base])
+    if generated.returncode != 0:
+        print(generated.stderr.strip() or generated.stdout.strip())
+        report.append(f"- {task_id}: no se pudo generar el workflow")
+        return False
+    workflow = generated.stdout.strip()
+
+    started = time.monotonic()
+    stop_beat = threading.Event()
+
+    def heartbeat() -> None:
+        # Crewplane no imprime nada mientras un proveedor trabaja, y un nodo
+        # puede durar 25 minutos. Sin esto, la terminal parece muerta.
+        while not stop_beat.wait(120):
+            current = latest_run_dir(task_id)
+            if current and time.monotonic() - started > 60:
+                print(f"{task_id}: {time.strftime('%H:%M')} {int((time.monotonic() - started) // 60)} min — "
+                      f"{run_progress(current)}", flush=True)
+
+    beat = threading.Thread(target=heartbeat, daemon=True)
+    beat.start()
+    with repo_lock():
+        before = tree_snapshot()
+    # Base propia para las pruebas que el ejecutor corra por su cuenta (el
+    # prompt le da el DSN). Sin ella comparte la de desarrollo, cuyos checksums
+    # de migraciones anteriores le hacen ver fallos ajenos.
+    task_db = urlparse(_GEN.task_dsn(task_id)).path.lstrip("/")
+    fresh_database(task_db, task_id)
+    try:
+        result = subprocess.run(["crewplane", "run", "--tasks", workflow, "--no-live", "--force"],
+                                cwd=ROOT, text=True)
+    except KeyboardInterrupt:
+        # Crewplane recibe la misma senal y muere; sus checkouts quedan en disco.
+        run_dir = latest_run_dir(task_id)
+        if run_dir:
+            kept = checkpoint_task(task_id, run_dir, report)
+            print(f"\n{task_id}: interrumpido. Trabajo conservado" + (f" en {kept}" if kept else "") + ".")
+        raise
+    finally:
+        stop_beat.set()
+    elapsed = time.monotonic() - started
+    with repo_lock():
+        leaked = leaked_paths(before, tree_snapshot())
+    if leaked:
+        kept = quarantine_leak(task_id, leaked, report, f"corrida {latest_run_dir(task_id).name[-15:] if latest_run_dir(task_id) else '?'}")
+        BASE_COMMIT = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+        print(f"{task_id}: un agente edito {len(leaked)} archivos en el repositorio principal, no en su worktree"
+              + (f". Conservados en {kept}; arbol restaurado" if kept else ""), flush=True)
+    if result.returncode != 0:
+        run_dir = latest_run_dir(task_id)
+        if run_dir:
+            saved = save_plan(run_dir, task_id, entrega)
+            if saved:
+                print(f"{task_id}: la corrida fallo, pero el plan quedo en {saved.relative_to(ROOT)}")
+                report.append(f"  - plan conservado pese al fallo: `{saved.relative_to(ROOT)}`")
+                if commit_plan_artifacts(task_id, "desglose conservado tras un fallo"):
+                    BASE_COMMIT = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+        kind = failure_kind(run_dir)
+        if kind == "quota" and allow_wait and attempt < MAX_TASK_RETRIES:
+            # La cuota se agoto a mitad de tarea: el dispatcher ya dejo el
+            # enfriamiento anotado, asi que el siguiente intento esperara lo justo.
+            report.append(f"- {task_id}: intento {attempt} cayo por cuota; se reintenta al liberarse")
+            print(f"{task_id}: cuota agotada a mitad de tarea. Reintento cuando se libere.")
+            return run_task(task_id, entrega, report, gate, merge, allow_wait, attempt + 1)
+        if kind == "agent_committed" and attempt < MAX_TASK_RETRIES:
+            branch = salvage_agent_commit(task_id, run_dir)
+            BASE_COMMIT = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+            if branch:
+                report.append(f"- {task_id}: el ejecutor hizo commit en el worktree; trabajo rescatado en `{branch}`, se reintenta")
+                print(f"{task_id}: el ejecutor hizo commit y crewplane descarto el checkout. "
+                      f"Trabajo rescatado en {branch}; reintento partiendo de el.")
+            else:
+                report.append(f"- {task_id}: el ejecutor hizo commit en el worktree; nada rescatable, se reintenta")
+                print(f"{task_id}: el ejecutor hizo commit y no quedo nada rescatable. Reintento.")
+            return run_task(task_id, entrega, report, gate, merge, allow_wait, attempt + 1)
+        if run_dir:
+            kept = checkpoint_task(task_id, run_dir, report)
+            if kept:
+                print(f"{task_id}: trabajo del intento conservado en {kept}")
+        report.append(f"- {task_id}: crewplane salio con codigo {result.returncode} (intento {attempt})")
+        if attempt < MAX_TASK_RETRIES:
+            # Un proveedor que se cuelga (idle timeout), un corte de red o un
+            # error de Crewplane no son motivo para dejar el tablero parado toda
+            # la noche: las rondas ya estan conservadas y el siguiente intento
+            # continua desde ellas. Solo tras varios intentos se detiene.
+            print(f"{task_id}: la corrida fallo (codigo {result.returncode}). Reintento en 2 min desde lo conservado.")
+            time.sleep(120)
+            return run_task(task_id, entrega, report, gate, merge, allow_wait, attempt + 1)
+        print(f"{task_id}: la corrida fallo {attempt} veces. Se detiene el tablero.")
+        return False
+
+    drop_database(task_db)
+    outcome = finish_task(task_id, entrega, latest_run_dir(task_id), report, gate, merge, elapsed)
+    if outcome is True:
+        swept = sweep_databases(live_task_ids() - {task_id})
+        if swept:
+            print(f"{task_id}: {len(swept)} bases de trabajo sobrantes borradas", flush=True)
+    if outcome == RETRY:
+        if attempt < MAX_TASK_RETRIES:
+            return run_task(task_id, entrega, report, gate, merge, allow_wait, attempt + 1)
+        print(f"{task_id}: {attempt} intentos sin pasar las pruebas. Se detiene el tablero.")
+        return False
+    return bool(outcome)
+
+
+def finish_task(task_id: str, entrega: str, run_dir: Path | None, report: list[str],
+                gate: str, merge: bool, elapsed: float) -> bool:
+    """Everything after Crewplane returns: plan, candidates, veto, tests, merge.
+
+    Kept separate so a finished run can be adopted later (`--adopt-last`) when
+    this process died, or was running older code, between Crewplane finishing
+    and the merge. The hour the agents spent is in the run directory, not here.
+    """
+    global BASE_COMMIT
+    if run_dir:
+        saved = save_plan(run_dir, task_id, entrega)
+        if saved:
+            print(f"{task_id}: plan guardado en {saved.relative_to(ROOT)}")
+            report.append(f"  - plan guardado en `{saved.relative_to(ROOT)}`")
+            sha = commit_plan_artifacts(task_id, "desglose acordado")
+            if sha:
+                BASE_COMMIT = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+                report.append(f"  - plan committeado en {sha}")
+    records = export_records(run_dir) if run_dir else []
+    candidates: list[tuple[str, str]] = [
+        (r["result_commit"], r.get("logical_worktree_name", "?")) for r in records]
+    exported = {commit for commit, _ in candidates}
+    # Always sweep the checkouts, not only when nothing was exported: a node that
+    # Crewplane marked failed can still hold finished work.
+    for commit, label in salvage_candidates(run_dir.name) if run_dir else []:
+        if commit not in exported:
+            candidates.append((commit, f"{label} (recuperado)"))
+            print(f"{task_id}: recuperado {commit[:12]} de un nodo no exportado ({label})")
+
+    scored = [(c, label, *commit_evidence(c)) for c, label in candidates]
+    working = [(c, label, ev) for c, label, ev, changed in scored if changed]
+    for commit, label, _, changed in scored:
+        mark = "cambios" if changed else "SIN CAMBIOS"
+        print(f"  candidato {label:12} {commit[:12]}  {mark}")
+    if not working:
+        # Corrida rota antes de exportar o ejecutor que no toco nada: el plan ya
+        # esta guardado y no hay nada que perder; otra vuelta cuesta menos que
+        # dejar el tablero parado.
+        report.append(f"- {task_id}: ninguno de los {len(scored)} candidatos toco el codigo; se reintenta")
+        print(f"{task_id}: ningun candidato produjo cambios. Reintento.")
+        return RETRY
+
+    report.append(f"- {task_id}: {elapsed:.0f}s, {len(working)}/{len(scored)} candidatos con cambios")
+    commit, label, evidence = working[0]
+
+    if gate == "review":
+        for commit, label, evidence in working:
+            print(f"\n--- {label} {commit[:12]} ---\n{evidence}")
+            print(f"Revisa:  git diff {BASE_COMMIT[:12]} {commit[:12]}")
+        print(f"Sigue:   .crewplane/bin/run-board --gate review")
+        return False
+
+    # Dos filtros, en este orden: el reviewer puede vetar, las pruebas deciden
+    # entre los que sobrevivan. Un veto sin pruebas seria opinion; unas pruebas
+    # sin veto solo dicen que compila, no que cumpla la tarea.
+    vetoed, verdicts, review_problem = review_verdicts(run_dir) if run_dir else ({}, 0, "sin corrida")
+    for commit, label, _ in working:
+        junk = scaffold_files(commit)
+        if junk and label not in vetoed:
+            vetoed[label] = "deja archivos de andamio en el repositorio: " + ", ".join(junk[:6])
+    if review_problem:
+        # Una revision que falla en silencio es peor que no tenerla: aprueba todo
+        # sin haber mirado nada. Si no hay veredicto legible, no se fusiona.
+        report.append(f"  - revision no utilizable: {review_problem}")
+        print(f"{task_id}: {review_problem}. No se fusiona a ciegas; se detiene el tablero.")
+        return False
+    print(f"  revision: {verdicts} veredictos leidos, {len(vetoed)} rechazos")
+    report.append(f"  - revision: {verdicts} veredictos, {len(vetoed)} rechazos")
+    for label, reason in vetoed.items():
+        print(f"  {label}: RECHAZADO por el reviewer — {reason}")
+        report.append(f"  - candidato {label} rechazado por el reviewer: {reason}")
+    survivors = [c for c in working if c[1] not in vetoed]
+    if not survivors:
+        report.append(f"  - el reviewer rechazo los {len(working)} candidatos con cambios")
+        # Rondas agotadas sin aprobacion: el trabajo de la ultima ronda vale mas
+        # que los issues solos. Conservarlo hace que el siguiente intento continue
+        # el bucle en vez de reabrirlo desde cero.
+        kept = checkpoint_task(task_id, run_dir, report) if run_dir else None
+        if kept:
+            print(f"{task_id}: trabajo de la ultima ronda conservado en {kept}")
+        noted = record_review_findings(run_dir, task_id, vetoed)
+        if noted:
+            print(f"{task_id}: hallazgos guardados en {noted.relative_to(ROOT)}; el siguiente intento parte de ellos")
+            report.append(f"  - hallazgos guardados en `{noted.relative_to(ROOT)}`")
+            if commit_plan_artifacts(task_id, "hallazgos de la revision"):
+                BASE_COMMIT = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+        # El trabajo y los hallazgos ya estan guardados: el siguiente intento
+        # arranca desde ambos. Parar aqui dejaba el tablero muerto toda la noche
+        # por una tarea que solo necesitaba otra vuelta.
+        print(f"{task_id}: el reviewer rechazo todos los candidatos. Reintento desde lo conservado.")
+        return RETRY
+
+    chosen = None
+    failures: list[tuple[str, str, str]] = []
+    for commit, label, evidence in survivors:
+        print(f"{task_id}: probando candidato {label} ({commit[:12]})...", flush=True)
+        outcome = gate_candidate(commit, task_id, entrega, merge)
+        if isinstance(outcome, TestsPassed):
+            report.append(f"  - candidato {label} {commit[:12]} pasa `make test` "
+                          f"({outcome})\n\n```\n{evidence}\n```")
+            print(f"{task_id}: {label} pasa — {outcome}. Elegido.")
+            chosen = (commit, label, outcome.merged)
+            break
+        if str(outcome).startswith("infra"):
+            # La base se cayo, no el candidato: reintentar sin anotar un fallo
+            # falso en el plan (el coder perdia una vuelta "arreglando" Postgres).
+            report.append(f"  - candidato {label} {commit[:12]}: {outcome}")
+            print(f"{task_id}: {outcome}. Reintento sin anotar fallo.", flush=True)
+            time.sleep(300)
+            return RETRY
+        if str(outcome).startswith("conflicto"):
+            # No fallo la suite: el parche no aplica sobre el HEAD actual.
+            report.append(f"  - candidato {label} {commit[:12]}: {outcome}")
+            return conflict_retry(task_id, run_dir, commit, str(outcome), report)
+        failures.append((label, commit, str(outcome)))
+        report.append(f"  - candidato {label} {commit[:12]} falla `make test`\n\n```\n{outcome}\n```")
+        print(f"{task_id}: {label} falla las pruebas. Siguiente candidato.")
+    if chosen is None:
+        # Aprobado por el reviewer pero roto para la suite: el trabajo vale y el
+        # fallo es concreto. Guardarlo en el plan y volver a intentar es lo que
+        # hace que el tablero siga solo en vez de esperar a una persona.
+        report.append(f"  - ningun candidato pasa `make test`; se reintenta con el fallo anotado")
+        kept = checkpoint_task(task_id, run_dir, report) if run_dir else None
+        for label, commit, output in failures[-1:]:
+            noted = record_test_failure(task_id, label, commit, output)
+            if noted:
+                print(f"{task_id}: fallo de make test anotado en {noted.relative_to(ROOT)}")
+        if commit_plan_artifacts(task_id, "fallo de make test del candidato aprobado"):
+            BASE_COMMIT = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+        print(f"{task_id}: ningun candidato pasa las pruebas"
+              + (f"; trabajo conservado en {kept}" if kept else "") + ". Reintento.")
+        return RETRY
+    commit, label, detail = chosen
+
+    if not merge:
+        report.append("  - sin fusionar: la siguiente tarea partira del mismo commit base")
+        return True
+    if not detail:
+        report.append("  - la fusion no dejo commit")
+        print(f"{task_id}: el porton paso pero no hubo fusion. Se detiene el tablero.")
+        return False
+    if mark_board(task_id, "En validación", f"`{detail}`"):
+        report.append(f"  - tablero: {task_id} en validacion")
+    BASE_COMMIT = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+    report.append(f"  - fusionado en {detail}")
+    print(f"{task_id}: fusionado en {detail}. La siguiente tarea parte de ahi.")
+    return True
+
+
+RETRY = "retry"
+BASE_DSN = "postgres://cortex:cortex@127.0.0.1:5433/cortex?sslmode=disable"
+
+
+def base_dsn() -> str:
+    return os.environ.get("CORTEX_TEST_DSN") or os.environ.get("CORTEX_DSN") or BASE_DSN
+
+
+def gate_dsn(task_id: str, dsn: str | None = None) -> str:
+    """The same server, a database of its own for this task's gate."""
+    parsed = urlparse(dsn or base_dsn())
+    return parsed._replace(path="/cortex_gate_" + task_id.lower().replace("-", "_")).geturl()
+
+
+def fresh_database(name: str, task_id: str) -> bool:
+    """(Re)create an empty database on the development server. False if psql failed."""
+    for statement in (f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)', f'CREATE DATABASE "{name}"'):
+        done = run(["psql", base_dsn(), "-v", "ON_ERROR_STOP=1", "-q", "-c", statement])
+        if done.returncode != 0:
+            print(f"{task_id}: no se pudo preparar la base {name} ({done.stderr.strip()[:160]})", flush=True)
+            return False
+    return True
+
+
+def drop_database(name: str) -> None:
+    run(["psql", base_dsn(), "-q", "-c", f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'])
+
+
+def fresh_gate_database(task_id: str) -> str | None:
+    """Create (or recreate) the gate database. Returns its DSN, or None if psql failed.
+
+    The suite runs against whatever CORTEX_TEST_DSN names and records each
+    migration's checksum there. Sharing the development database with the
+    executor's own test runs poisoned the gate on 2026-09-19: M01-03 was
+    approved and failed `make test` only because an earlier round had applied a
+    different version of 0018_access_policy.sql to that database.
+    """
+    name = urlparse(gate_dsn(task_id)).path.lstrip("/")
+    for statement in (f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)', f'CREATE DATABASE "{name}"'):
+        done = run(["psql", base_dsn(), "-v", "ON_ERROR_STOP=1", "-q", "-c", statement])
+        if done.returncode != 0:
+            # Nunca caer a la base compartida: por defecto es `cortex`, la de
+            # desarrollo, y la suite le aplicaria migraciones sin fusionar
+            # (M07-01, 2026-09-27 21:39, con Postgres reiniciandose).
+            print(f"{task_id}: no se pudo preparar la base de pruebas ({done.stderr.strip()[:160]})", flush=True)
+            return None
+    return gate_dsn(task_id)
+
+
+DB_CRASH = re.compile(r"SQLSTATE 57P0[1-3]|in recovery mode|not yet accepting connections|"
+                      r"terminating connection because of crash|server closed the connection unexpectedly")
+
+
+LOAD_TIMEOUT = re.compile(r"i/o timeout|context deadline exceeded|Client\.Timeout exceeded")
+TEST_FAIL = re.compile(r"^\s*--- FAIL: (\S+)", re.MULTILINE)
+
+
+def load_timeout(output: str) -> bool:
+    """True if every failing test in the suite failed on a timeout, the signature of machine load.
+
+    A compile error, a vet error or an assertion is never a timeout, so those still
+    go back to the task on the first run.
+    """
+    if not LOAD_TIMEOUT.search(output) or "vet:" in output or "build failed" in output:
+        return False
+    blocks = re.split(r"(?m)^(?=\s*--- FAIL: )", output)
+    failing = [b for b in blocks if TEST_FAIL.match(b)]
+    return bool(failing) and all(LOAD_TIMEOUT.search(b) for b in failing)
+
+
+def database_crashed(output: str) -> bool:
+    """True if a failed suite lost Postgres mid-run rather than failing on its own."""
+    return bool(DB_CRASH.search(output))
+
+
+def wait_for_database(timeout: float = 300, interval: float = 5) -> bool:
+    """Wait until the development server accepts queries again (after a crash it recovers in seconds)."""
+    deadline = time.time() + timeout
+    while True:
+        if run(["psql", base_dsn(), "-q", "-tAc", "select 1"]).returncode == 0:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+GATE_DB_ATTEMPTS = 3
+
+
+PROTECTED_DATABASES = {"cortex", "cortex_test", "cortexbrain"}
+DB_TASK = re.compile(r"([a-z])(\d{2})_?(\d{2})")
+
+
+def database_task(name: str) -> str | None:
+    """Task id (m01_03) a scratch database name refers to, if any."""
+    match = DB_TASK.search(name)
+    return f"{match.group(1)}{match.group(2)}_{match.group(3)}" if match else None
+
+
+def sweep_databases(live_tasks: set[str]) -> list[str]:
+    """Drop cortex_* scratch databases that belong to no running task.
+
+    Executors and reviewers create their own (`cortex_rev_m0602`,
+    `cortex_task_m04_02_fix`...) besides the ones the board makes; on 2026-09-20
+    there were 27 and Postgres restarted under the load. Anything naming a task
+    that is not live goes; the dev/test databases never do.
+    """
+    listed = run(["psql", base_dsn(), "-Atc", "select datname from pg_database where datname like 'cortex_%'"]).stdout.split()
+    live = {t.lower().replace("-", "_") for t in live_tasks}
+    dropped = []
+    for name in listed:
+        # cortex_gate_orch*: Core temporales del orquestador para evidencia; los borra su script.
+        if name in PROTECTED_DATABASES or name.startswith("cortex_gate_orch") or database_task(name) in live:
+            continue
+        if run(["psql", base_dsn(), "-q", "-c", f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)']).returncode == 0:
+            dropped.append(name)
+    return dropped
+
+
+def live_task_ids() -> set[str]:
+    """Tasks the live boards are on right now, read from their logs."""
+    tasks = set()
+    for scope, _pid in live_boards():
+        log = ROOT / ".crewplane" / (f"board-{scope[5:]}.log" if scope.startswith("only-") else "board.log")
+        try:
+            found = re.findall(r"^=== ([A-Z]\d{2}-\d{2})", log.read_text(encoding="utf-8", errors="replace"), re.M)
+        except OSError:
+            continue
+        if found:
+            tasks.add(found[-1])
+    return tasks
+
+
+def drop_gate_database(task_id: str) -> None:
+    name = urlparse(gate_dsn(task_id)).path.lstrip("/")
+    run(["psql", base_dsn(), "-q", "-c", f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'])
+
+
+def conflict_retry(task_id: str, run_dir: Path | None, commit: str, detail: str, report: list[str]):
+    """Another task touched the same files meanwhile: keep the work, note it, retry on the new HEAD."""
+    kept = checkpoint_task(task_id, run_dir, report) if run_dir else None
+    plan = PLANS_DIR / f"{task_id}.md"
+    if plan.is_file():
+        with plan.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n\n## Conflicto al fusionar (`{commit[:12]}`)\n\nEl candidato aprobado no aplica "
+                         f"sobre el HEAD actual porque otra tarea fusionada toco los mismos archivos ({detail}). "
+                         f"Parte del codigo actual del worktree y trae de la rama solo lo que siga valiendo.\n")
+        commit_plan_artifacts(task_id, "conflicto al fusionar")
+    report.append(f"  - conflicto al fusionar; se reintenta sobre el HEAD nuevo")
+    print(f"{task_id}: conflicto al fusionar" + (f"; trabajo en {kept}" if kept else "") + ". Reintento sobre el HEAD nuevo.")
+    return RETRY
+
+
+def record_test_failure(task_id: str, label: str, commit: str, output: str) -> Path | None:
+    """Append the failing tail of `make test` to the plan so the next attempt fixes it."""
+    plan = PLANS_DIR / f"{task_id}.md"
+    if not plan.is_file():
+        return None
+    with plan.open("a", encoding="utf-8") as handle:
+        handle.write(f"\n\n## Fallo de `make test` sobre el candidato aprobado (`{commit[:12]}`, {label})\n\n"
+                     "El reviewer aprobo este resultado pero la suite completa fallo en una base de datos "
+                     "limpia. Reproduce con `make test` y corrige exactamente esto antes de nada:\n\n"
+                     f"```text\n{output.strip()}\n```\n")
+    return plan
+
+
+def gate_candidate(commit: str, task_id: str, entrega: str, merge: bool, _retry: bool = True):
+    """Test the merged tree and, if asked, fast-forward HEAD to it, all under the repo lock.
+
+    The lock covers the whole gate: HEAD cannot move between the test and the
+    merge, so the tested tree is the merged tree byte for byte, conflict
+    resolutions included. Other boards wait a few minutes; before this they
+    lost hours re-running tasks whose candidate no longer applied.
+    """
+    with repo_lock():
+        outcome = worktree_tests(commit, task_id, keep_worktree=merge)
+        if not isinstance(outcome, TestsPassed) or not merge:
+            gate_worktree_cleanup(task_id)
+            return outcome
+        path = gate_worktree_path(task_id)
+        try:
+            committed = run(["git", "commit", "-q", "-m", f"{task_id}: {entrega}"], cwd=path)
+            if committed.returncode != 0:
+                return f"no se pudo commitear el arbol probado: {(committed.stderr or committed.stdout).strip()[:200]}"
+            sha = run(["git", "rev-parse", "HEAD"], cwd=path).stdout.strip()
+            ff = run(["git", "merge", "--ff-only", sha])
+            if ff.returncode != 0:
+                # HEAD se movio pese al cerrojo (un commit manual, 2026-09-20
+                # 11:16). El arbol probado ya no sirve; repetir el porton una
+                # vez cuesta dos minutos, reintentar la tarea cuesta una hora.
+                gate_worktree_cleanup(task_id)
+                if _retry:
+                    print(f"{task_id}: HEAD avanzo durante el porton; lo repito sobre el HEAD nuevo", flush=True)
+                    return gate_candidate(commit, task_id, entrega, merge, _retry=False)
+                return f"conflicto: HEAD avanzo durante el porton dos veces ({ff.stderr.strip().splitlines()[0][:120] if ff.stderr.strip() else 'no fast-forward'})"
+            outcome.merged = run(["git", "rev-parse", "--short", "HEAD"]).stdout.strip()
+            return outcome
+        finally:
+            gate_worktree_cleanup(task_id)
+
+
+def gofmt_staged(cwd: Path) -> list[str]:
+    """Format the staged Go files of the candidate in place and re-stage them.
+
+    `make test` fails on `gofmt -l` alone. Approved candidates of B04-01 and
+    M05-01 lost a full retry (~40 min) to whitespace in a test file; formatting
+    is mechanical, so the gate applies it instead of sending the task back.
+    """
+    names = run(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"], cwd=cwd).stdout.split()
+    go_files = [n for n in names if n.endswith(".go") and (cwd / n).is_file()]
+    if not go_files:
+        return []
+    listed = run(["gofmt", "-l", *go_files], cwd=cwd)
+    dirty = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+    if not dirty:
+        return []
+    if run(["gofmt", "-w", *dirty], cwd=cwd).returncode != 0:
+        return []
+    run(["git", "add", "--", *dirty], cwd=cwd)
+    return dirty
+
+
+def gate_worktree_path(task_id: str) -> Path:
+    return Path(f"/home/allrivenjs/.cache/crewplane-gate/{task_id}")
+
+
+def gate_worktree_cleanup(task_id: str) -> None:
+    run(["git", "worktree", "remove", "--force", str(gate_worktree_path(task_id))])
+    drop_gate_database(task_id)
+
+
+def worktree_tests(commit: str, task_id: str, keep_worktree: bool = False):
+    """Run `make test` against the exported result in a throwaway worktree.
+
+    Testing the exported commit rather than the main checkout keeps an unproven
+    result out of the working tree until it has earned the merge.
+    """
+    path = gate_worktree_path(task_id)
+    run(["git", "worktree", "remove", "--force", str(path)])
+    # En HEAD, no en el candidato: se prueba el arbol que va a fusionarse.
+    created = run(["git", "worktree", "add", "-q", "--detach", str(path), "HEAD"])
+    if created.returncode != 0:
+        return f"no se pudo crear el worktree de pruebas: {created.stderr.strip()}"
+    try:
+        applied, detail = apply_candidate(commit, task_id, path)
+        if not applied:
+            return f"conflicto al aplicar sobre HEAD: {detail}" if detail.startswith("conflicto") else f"no aplica sobre HEAD: {detail}"
+        formatted = gofmt_staged(path)
+        if formatted:
+            print(f"{task_id}: gofmt aplicado en el porton a {', '.join(formatted)}", flush=True)
+        link_node_modules(path)
+        output = ""
+        for attempt in range(1, GATE_DB_ATTEMPTS + 1):
+            wait_for_database()
+            dsn = fresh_gate_database(task_id)
+            if not dsn:
+                output = "no se pudo crear la base del porton"
+                continue
+            # Paquetes de Go de uno en uno: en paralelo compartian la base del
+            # porton y httpapi agotaba sus plazos de 10 s (M10-05, M12-04,
+            # 2026-09-29/30); ademas baja la carga que precede a las caidas de Postgres.
+            # CORTEX_GRAPH_TEST_DSN: sin ella los tests de AGE (graph, httpapi) se saltaban
+            # en silencio; el plan mapa-cerebro fusiono codigo de grafo sin probarlo
+            # (2026-10-02). CI=1 convierte cualquier salto por DSN ausente en fallo.
+            env = dict(os.environ, CORTEX_TEST_DSN=dsn, CORTEX_DSN=dsn, CORTEX_GRAPH_TEST_DSN=dsn, CI="1",
+                       GOFLAGS=(os.environ.get("GOFLAGS", "") + " -p=1").strip())
+            tests = subprocess.run(["make", "test"], cwd=path, text=True, capture_output=True, env=env)
+            output = tests.stdout + tests.stderr
+            if tests.returncode == 0:
+                return test_coverage_note(output)
+            if load_timeout(output) and attempt == 1:
+                # Con varios tableros compilando a la vez, un test HTTP con plazo de 10 s
+                # puede vencer sin culpa del candidato (B06-05, 2026-10-01). Una repeticion.
+                print(f"{task_id}: la suite fallo solo por plazos vencidos (carga); la repito una vez", flush=True)
+                continue
+            if not database_crashed(output):
+                return failing_tail(output)
+            print(f"{task_id}: Postgres se reinicio durante el porton (intento {attempt}); "
+                  f"espero a que vuelva y repito la suite", flush=True)
+        # Fallo de infraestructura, no del candidato: no se anota en el plan.
+        return f"infra: Postgres no sostuvo la suite tras {GATE_DB_ATTEMPTS} intentos ({failing_tail(output, 3)[:200]})"
+    finally:
+        if not keep_worktree:
+            run(["git", "worktree", "remove", "--force", str(path)])
+            drop_gate_database(task_id)
+
+
+NOISE = re.compile(r"INFO applied migration|^ok\s|\[no test files\]|^\s*$")
+
+
+def failing_tail(output: str, limit: int = 40) -> str:
+    """The lines of a failed `make test` that say what failed, without migration chatter.
+
+    The plain tail was 25 lines of `applied migration` on 2026-09-20 (M11-04):
+    the failing test name never reached the plan, and the executor retried
+    blind.
+    """
+    lines = [line for line in output.splitlines() if not NOISE.search(line)]
+    return "\n".join(lines[-limit:])
+
+
+NODE_PACKAGES = ("mcp", "dashboard")
+
+
+def link_node_modules(path: Path) -> list[str]:
+    """Point the throwaway worktree at the main checkout's node_modules.
+
+    `make test` ends with `npx tsc --noEmit` in mcp/ and dashboard/. A fresh
+    worktree has no node_modules, so npx offers to download a stray `tsc`
+    package and fails; on 2026-09-19 that rejected an M01-03 candidate whose
+    Go suite was green. Installing per gate would cost minutes and network;
+    the dependencies do not change per task.
+    """
+    linked = []
+    for package in NODE_PACKAGES:
+        source = ROOT / package / "node_modules"
+        target = path / package / "node_modules"
+        if source.is_dir() and (path / package).is_dir() and not target.exists():
+            target.symlink_to(source, target_is_directory=True)
+            linked.append(package)
+    return linked
+
+
+def test_coverage_note(output: str) -> object:
+    """Say what the suite actually exercised, not just that it exited zero.
+
+    `make test` passes CORTEX_TEST_DSN through; with it unset the integration
+    tests skip and the suite still reports success. A gate that cannot tell
+    "passed" from "did not run" grants false confidence.
+    """
+    ran = sum(1 for line in output.splitlines() if line.startswith("ok  "))
+    empty = sum(1 for line in output.splitlines() if "no test files" in line)
+    skipped = output.count("--- SKIP")
+    note = f"{ran} paquetes con pruebas, {empty} sin ficheros de test, {skipped} subtests omitidos"
+    # El Makefile ya da un valor por defecto a CORTEX_TEST_DSN, asi que la variable
+    # de entorno no dice nada: lo que decide es si la base responde.
+    if skipped and not database_reachable():
+        note += "; la base no responde, la integracion se omitio"
+    return TestsPassed(note)
+
+
+def database_reachable() -> bool:
+    dsn = os.environ.get("CORTEX_TEST_DSN") or os.environ.get("CORTEX_DSN") or \
+        "postgres://cortex:cortex@127.0.0.1:5433/cortex"
+    parsed = urlparse(dsn)
+    try:
+        with socket.create_connection((parsed.hostname or "127.0.0.1", parsed.port or 5432), 2):
+            return True
+    except OSError:
+        return False
+
+
+class TestsPassed:
+    """Truthy result that carries what the suite covered (and the merged sha, if any)."""
+    merged: str | None = None
+
+    def __init__(self, note: str) -> None:
+        self.note = note
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __str__(self) -> str:
+        return self.note
+
+
+def main(argv: list[str]) -> int:
+    global BASE_COMMIT
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--gate", choices=["review", "tests"], default="review")
+    parser.add_argument("--only", help="restringir a un modulo, p. ej. M01")
+    parser.add_argument("--group", choices=sorted(GROUPS), help="restringir a un grupo de objetivos")
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-wait", action="store_true",
+                        help="no esperar a que vuelva la cuota: detenerse si un rol no tiene proveedor")
+    parser.add_argument("--adopt-last", metavar="TAREA",
+                        help="no lanzar crewplane: tomar la ultima corrida terminada de esa tarea y "
+                             "pasarla por revision, pruebas y fusion")
+    parser.add_argument("--check-quota", action="store_true",
+                        help="mostrar que proveedores estan disponibles por rol y salir")
+    parser.add_argument("--merge", action="store_true",
+                        help="tras pasar el gate, fusiona el worktree en la rama actual "
+                             "como un commit, para que la tarea siguiente lo herede")
+    args = parser.parse_args(argv)
+
+    if args.adopt_last:
+        task_id = args.adopt_last.upper()
+        rows = {r[0]: r for r in board_tasks()}
+        if task_id not in rows:
+            print(f"{task_id} no esta en el tablero"); return 1
+        stages = ROOT / ".crewplane/execution-stages"
+        runs = sorted((d for d in stages.iterdir() if d.name.startswith(f"tencent-{task_id.lower()}--")),
+                      key=lambda d: d.name[-15:])
+        if not runs:
+            print(f"no hay corridas de {task_id}"); return 1
+        runs = pick_adoptable(runs)
+        if args.only or args.group:
+            # Va a seguir con la cola: reservar ya su ambito, para que otro
+            # tablero no lo pise mientras espera a la corrida viva.
+            scope = board_scope(args.only, args.group)
+            clash = overlapping_board(scope)
+            if clash:
+                print(f"Ya hay un tablero corriendo sobre {clash[0]} (pid {clash[1]}) que comparte modulos con {scope}.")
+                return 1
+            board_lock_path(scope).parent.mkdir(parents=True, exist_ok=True)
+            board_lock_path(scope).write_text(str(os.getpid()), encoding="utf-8")
+        BASE_COMMIT = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = runs[-1]
+        report = [f"# Adopcion de corrida {target.name}", ""]
+        while run_status(target) is None:
+            pid = run_is_live(target)
+            if pid is None:
+                exe, rev = rounds_completed(target)
+                kept = checkpoint_task(task_id, target, report)
+                print(f"{task_id}: la corrida {target.name[-15:]} murio a medias (ejecutor {exe}, reviewer {rev}). "
+                      f"Trabajo conservado" + (f" en {kept}" if kept else "") + ". Relanza la tarea para continuar desde ahi.")
+                REPORTS.mkdir(parents=True, exist_ok=True)
+                (REPORTS / f"{stamp}-adopt.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+                return 1
+            if args.no_wait:
+                print(f"{task_id}: la corrida {target.name[-15:]} sigue en marcha (pid {pid}). "
+                      f"Vuelve a intentarlo cuando termine, o sin --no-wait para esperar.")
+                return 1
+            print(f"{task_id}: {time.strftime('%H:%M')} corrida {target.name[-15:]} viva (pid {pid}) — "
+                  f"{run_progress(target)}", flush=True)
+            time.sleep(60)
+        print(f"{task_id}: corrida {target.name[-15:]} terminada con estado {run_status(target)}; adoptando.")
+        ok = finish_task(task_id, rows[task_id][1], target, report, args.gate, args.merge, 0.0)
+        if ok == RETRY:
+            # Pruebas rotas o conflicto al fusionar: el motivo ya esta en el plan
+            # y el trabajo en salvage/. Con --only/--group la cola vuelve a tomar
+            # la tarea (sigue Pendiente); sin ellos, queda para quien relance.
+            if args.group or args.only:
+                print(f"{task_id}: la adopcion no fusiono (motivo en el plan); la cola reintenta la tarea.")
+                ok = True
+            else:
+                print(f"{task_id}: la adopcion no fusiono; el motivo quedo en el plan. Relanza la tarea.")
+                ok = False
+        REPORTS.mkdir(parents=True, exist_ok=True)
+        (REPORTS / f"{stamp}-adopt.md").write_text("\n".join(report) + "\n", encoding="utf-8")
+        if not ok or not (args.group or args.only):
+            return 0 if ok else 1
+        print(f"\n{task_id} adoptada. Sigo con la cola ({args.group or args.only}).", flush=True)
+
+    if args.check_quota:
+        now = time.time()
+        for role in ("thinker", "coder", "reviewer"):
+            order, path = role_providers(role)
+            cooling = cooldowns(path)
+            parts = []
+            for prov in order:
+                left = cooling.get(prov, 0.0) - now
+                parts.append(f"{prov} (en enfriamiento {left/60:.0f} min)" if left > 0 else prov)
+            print(f"  {role:9} {' -> '.join(parts) or 'sin proveedores'}")
+        return 0
+
+    tasks = ordered_pending(args.only, args.group)
+    if args.limit:
+        tasks = tasks[:args.limit]
+    if not tasks:
+        print("No hay tareas pendientes que coincidan.")
+        return 1
+
+    if args.dry_run:
+        current = None
+        for index, (task_id, entrega, _) in enumerate(tasks, 1):
+            group = _GEN.group_of(task_id)
+            if group != current:
+                current = group
+                print(f"\n{group} · {GROUPS[group][0]} · {_GEN.AUDIT_ROUNDS[group]} rondas de revision")
+            plan_note = "plan guardado" if _GEN.saved_plan(task_id) else "planifica"
+            print(f"{index:>3}. {task_id}  {entrega}  [{plan_note}]")
+        print(f"\n{len(tasks)} tareas. Gate: {args.gate}.")
+        return 0
+
+    scope = board_scope(args.only, args.group)
+    clash = overlapping_board(scope)
+    if clash:
+        other_scope, other = clash
+        print(f"Ya hay un tablero corriendo sobre {other_scope} (pid {other}) que comparte modulos con {scope}. "
+              f"Dos a la vez sobre lo mismo duplican tareas; usa `pkill -f bin/run-board` si quieres reemplazarlo.")
+        return 1
+    board_lock = board_lock_path(scope)
+    board_lock.parent.mkdir(parents=True, exist_ok=True)
+    board_lock.write_text(str(os.getpid()), encoding="utf-8")
+
+    BASE_COMMIT = run(["git", "rev-parse", "HEAD"]).stdout.strip() or "HEAD"
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    report = [f"# Ejecucion del tablero {stamp}", "",
+              f"Gate: {args.gate}. Fusion entre tareas: {'si' if args.merge else 'no'}. "
+              f"Tareas seleccionadas: {len(tasks)}.",
+              f"Commit base: {BASE_COMMIT[:12]}.", ""]
+    completed = 0
+    seen: set[str] = set()
+    try:
+        while True:
+            # Recalcular la cola tras cada tarea: otro tablero puede haber
+            # fusionado dependencias (o tareas de este mismo modulo) entre medias.
+            queue = [row for row in ordered_pending(args.only, args.group) if row[0] not in seen]
+            if args.limit and completed >= args.limit:
+                break
+            if not queue:
+                for task_id, deps in blocked_pending(args.only, args.group):
+                    if task_id not in seen:
+                        print(f"{task_id}: bloqueada; espera a {', '.join(deps)} (fuera de esta seleccion)")
+                break
+            task_id, entrega, _ = queue[0]
+            seen.add(task_id)
+            if not run_task(task_id, entrega, report, args.gate, args.merge, not args.no_wait):
+                break
+            completed += 1
+    finally:
+        REPORTS.mkdir(parents=True, exist_ok=True)
+        target = REPORTS / f"{stamp}.md"
+        target.write_text("\n".join(report) + "\n", encoding="utf-8")
+        print(f"\nInforme: {target.relative_to(ROOT)}")
+        print(f"Tareas con evidencia: {completed}/{len(tasks)}")
+        if board_lock.is_file() and board_lock.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            board_lock.unlink()
+    return 0 if completed else 1
+
+
+
+
+# Escrituras al checkout principal, siempre bajo el cerrojo del repositorio.
+def merge_result(*args, **kwargs):
+    with repo_lock():
+        return _merge_result_unlocked(*args, **kwargs)
+
+
+def commit_plan_artifacts(*args, **kwargs):
+    with repo_lock():
+        return _commit_plan_artifacts_unlocked(*args, **kwargs)
+
+
+def mark_board(*args, **kwargs):
+    with repo_lock():
+        return _mark_board_unlocked(*args, **kwargs)
+
+
+def quarantine_leak(*args, **kwargs):
+    with repo_lock():
+        return _quarantine_leak_unlocked(*args, **kwargs)
+
+
+def checkpoint_task(*args, **kwargs):
+    with repo_lock():
+        return _checkpoint_task_unlocked(*args, **kwargs)
+
+
+def salvage_agent_commit(*args, **kwargs):
+    with repo_lock():
+        return _salvage_agent_commit_unlocked(*args, **kwargs)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

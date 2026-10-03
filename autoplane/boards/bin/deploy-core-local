@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Despliega el Core de HEAD en el servicio local cortex-core, con respaldo previo.
+# Lo ejecuta la persona: toca la base real `cortex` (migraciones) y el servicio.
+set -euo pipefail
+ROOT=/mnt/ssd500/projects/personal/cortex
+cd "$ROOT"
+set -a; . ~/.config/cortex/core.env; set +a
+stamp=$(date +%Y%m%dT%H%M%S)
+echo "== HEAD $(git rev-parse --short HEAD)  versión instalada: $(curl -s http://127.0.0.1:8742/health)"
+
+echo "== 1. Respaldo de la base cortex"
+mkdir -p backups
+pg_dump "$CORTEX_DSN" -Fc -f "backups/cortex-before-deploy-$stamp.dump"
+size=$(stat -c %s "backups/cortex-before-deploy-$stamp.dump")
+[ "$size" -gt 1000 ] || { echo "respaldo vacío ($size bytes): me detengo"; exit 1; }
+echo "respaldo: backups/cortex-before-deploy-$stamp.dump ($size bytes, $(pg_restore -l backups/cortex-before-deploy-$stamp.dump | wc -l) objetos)"
+
+echo "== 2. Compilar Core y CLI"
+make core-build cli-build
+
+echo "== 3. Instalar (binario anterior en ~/.local/bin/cortex-core.bak-$stamp)"
+cp ~/.local/bin/cortex-core ~/.local/bin/cortex-core.bak-$stamp
+install -m755 bin/cortex-core ~/.local/bin/cortex-core
+[ -f ~/.local/bin/cortex ] && cp ~/.local/bin/cortex ~/.local/bin/cortex.bak-$stamp || true
+install -m755 bin/cortex ~/.local/bin/cortex
+
+echo "== 4. Reiniciar cortex-core"
+systemctl --user restart cortex-core
+for i in $(seq 1 60); do curl -sf http://127.0.0.1:8742/health >/dev/null && break; sleep 1; done
+echo "versión nueva: $(curl -s http://127.0.0.1:8742/health)"
+
+echo "== 5. Indexar y mapear Cortex"
+export CORTEX_TOKEN=$(cat ~/.config/cortex/agent-token)
+bin/cortex index . --project cortex --apply 2>&1 | tail -3
+bin/cortex map . --project cortex --apply 2>&1 | tail -2
+echo "== listo. Para volver atrás: cp ~/.local/bin/cortex-core.bak-$stamp ~/.local/bin/cortex-core && systemctl --user restart cortex-core"
+echo "   (y restaurar la base: pg_restore --clean -d \"\$CORTEX_DSN\" backups/cortex-before-deploy-$stamp.dump)"

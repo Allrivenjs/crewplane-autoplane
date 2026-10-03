@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Una pantalla con todo lo que pasa en el tablero Tencent.
+
+  board-status            estado ahora mismo
+  watch -n 60 .crewplane/bin/board-status    refrescado cada minuto
+"""
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+rb = SourceFileLoader("run_board", str(ROOT / ".crewplane/bin/run-board")).load_module()
+
+
+def git(*args: str) -> str:
+    return subprocess.run(["git", *args], cwd=ROOT, text=True, capture_output=True).stdout
+
+
+def main() -> int:
+    print(f"Tablero Tencent · {time.strftime('%Y-%m-%d %H:%M')}\n")
+
+    boards = rb.live_boards()
+    print("Tableros vivos:", ", ".join(f"{s} (pid {p})" for s, p in boards) or "ninguno")
+
+    beats: dict[str, str] = {}
+    logs = sorted((ROOT / ".crewplane").glob("board*.log"), key=lambda f: f.stat().st_mtime)
+    for log in logs:
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines()[-400:]:
+            m = re.match(r"^(M\d{2}-\d{2}): (.*)$", line)
+            if m:
+                beats[m.group(1)] = m.group(2)
+    for task_id, text in list(beats.items())[-4:]:
+        print(f"  {task_id}: {text[:150]}")
+
+    print("\nCorridas abiertas:")
+    stages = ROOT / ".crewplane/execution-stages"
+    open_runs = [d for d in sorted(stages.iterdir(), key=lambda d: d.name[-15:])
+                 if d.is_dir() and rb.run_status(d) is None and rb.run_is_live(d)] if stages.is_dir() else []
+    for run_dir in open_runs[-3:]:
+        verdicts = []
+        for f in sorted(run_dir.glob("**/*.review.json")):
+            try:
+                d = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            cyc = re.search(r"review-audit-round-(\d+)", str(f)); rnd = re.search(r"_round(\d+)\.review", f.name)
+            verdicts.append(f"c{cyc.group(1) if cyc else '?'}r{rnd.group(1) if rnd else '?'}="
+                            f"{'OK' if d.get('approved') else 'CAMBIOS'}({d.get('unresolved_issue_count', '?')})")
+        print(f"  {run_dir.name[8:14].upper()} {run_dir.name[-15:]}  {' '.join(verdicts) or 'sin revisiones aun'}")
+    if not open_runs:
+        print("  ninguna")
+
+    print("\nCuota por rol:")
+    now = time.time()
+    for role in ("thinker", "coder", "reviewer"):
+        order, path = rb.role_providers(role)
+        cooling = rb.cooldowns(path)
+        parts = []
+        for prov in order:
+            left = cooling.get(prov, 0.0) - now
+            parts.append(f"{prov} (vuelve {time.strftime('%d %H:%M', time.localtime(now + left))})" if left > 0 else prov)
+        print(f"  {role:9} {' -> '.join(parts)}")
+
+    counts: dict[str, int] = {}
+    for _, _, state in rb.board_tasks():
+        counts[state.strip()] = counts.get(state.strip(), 0) + 1
+    print("\nTablero:", ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+
+    print("\nUltimas fusiones:")
+    merges = git("log", "--extended-regexp", "--grep", r"^M[0-9]{2}-[0-9]{2}: ", "--format=%h %cd %s", "--date=format:%d %H:%M", "-5")
+    print("  " + merges.strip().replace("\n", "\n  ") if merges.strip() else "  ninguna")
+
+    totals: dict[str, dict[str, int]] = {}
+    for name in ("cortex-write.jsonl", "cortex.jsonl"):
+        path = ROOT / "crewplane-multi-agent-sandbox/.agent/logs" / name
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            tk = d.get("tokens")
+            if not tk:
+                continue
+            t = totals.setdefault(d["provider"], {"in": 0, "out": 0, "cache": 0, "n": 0})
+            t["in"] += tk.get("in", 0); t["out"] += tk.get("out", 0); t["cache"] += tk.get("cache", 0); t["n"] += 1
+    if totals:
+        print("\nTokens por proveedor (desde que se registran):")
+        for prov, t in sorted(totals.items(), key=lambda x: -(x[1]["in"] + x[1]["cache"])):
+            print(f"  {prov:22} {t['n']:4} llamadas  in {t['in']/1e6:6.2f}M  cache {t['cache']/1e6:6.2f}M  out {t['out']/1e6:5.2f}M")
+
+    salvage = [b.strip() for b in git("branch", "--list", "salvage/*").splitlines()]
+    print(f"\nRamas salvage: {len(salvage)}" + (f" (ultima {salvage[-1]})" if salvage else ""))
+    print("\nLogs: tail -f .crewplane/board*.log")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

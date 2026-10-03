@@ -1,0 +1,1166 @@
+{
+  "timeout_seconds": 5400,
+  "role_order": {
+    "coder": [
+      "ali-dsflash",
+      "codex-sol",
+      "opencode-go-glm",
+      "opencode-go-kimi",
+      "ali-qwenplus",
+      "codex-luna",
+      "opencode-go-glmflash",
+      "ali-glm",
+      "ali-qwenflash",
+      "opencode-go-minimax",
+      "opencode-go-qwenplus",
+      "ali-qwenmax",
+      "opencode-go-qwenmax",
+      "opencode-go-luna",
+      "antigravity-flash",
+      "antigravity-sonnet",
+      "antigravity",
+      "opencode-free",
+      "opencode-free-nemotron"
+    ]
+  },
+  "log_path": "/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/.agent/logs/cortex-write.jsonl",
+  "providers": {
+    "claude": {
+      "enabled": true,
+      "prompt_transport": "stdin",
+      "output_format": "claude-stream",
+      "command": [
+        "claude",
+        "--model",
+        "{model}",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        "acceptEdits",
+        "--permission-prompts",
+        "none"
+      ],
+      "patterns": {
+        "quota": [
+          "usage limit reached",
+          "rate limit reached",
+          "quota reached",
+          "too many requests",
+          "usage limit",
+          "rate_limit_error",
+          "rate limit"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "try again later"
+        ],
+        "auth": [
+          "not logged in",
+          "authentication required",
+          "invalid api key",
+          "unauthorized"
+        ]
+      }
+    },
+    "codex": {
+      "enabled": true,
+      "prompt_transport": "stdin",
+      "output_format": "codex-jsonl",
+      "command": [
+        "codex",
+        "exec",
+        "--model",
+        "{model}",
+        "--json",
+        "-c",
+        "model_reasoning_effort={effort}",
+        "--sandbox",
+        "workspace-write",
+        "-"
+      ],
+      "patterns": {
+        "quota": [
+          "usage limit exceeded",
+          "rate limit reached",
+          "quota reached",
+          "too many requests",
+          "hit your usage limit",
+          "purchase more credits",
+          "rate limit",
+          "429"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "try again later"
+        ],
+        "auth": [
+          "not logged in",
+          "authentication required",
+          "invalid api key",
+          "unauthorized"
+        ]
+      },
+      "quota_pool": "codex"
+    },
+    "antigravity": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "agy-stream",
+      "command": [
+        "agy",
+        "--model",
+        "{model}",
+        "--mode=accept-edits",
+        "--dangerously-skip-permissions",
+        "--add-dir",
+        "{cwd}",
+        "--output-format",
+        "stream-json",
+        "-p"
+      ],
+      "patterns": {
+        "quota": [
+          "resource exhausted",
+          "quota exceeded",
+          "quota will reset",
+          "rate limit reached",
+          "resource_exhausted",
+          "429",
+          "rate limit",
+          "quota reached",
+          "individual quota"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "try again later"
+        ],
+        "auth": [
+          "not signed in",
+          "authentication required",
+          "unauthorized",
+          "login required"
+        ]
+      },
+      "note": "Escribe sin flags de bypass siempre que el directorio este en trustedWorkspaces de ~/.gemini/antigravity-cli/settings.json. Los worktrees de Crewplane viven bajo /home/allrivenjs/.cache, cubierto por esa lista. --add-dir es obligatorio: sin el, sus herramientas de archivo resuelven contra su propio scratch y reporta SUCCESS sin tocar el worktree.",
+      "quota_pool": "antigravity-gemini"
+    },
+    "antigravity-sonnet": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "agy-stream",
+      "command": [
+        "agy",
+        "--model",
+        "{model}",
+        "--mode=accept-edits",
+        "--dangerously-skip-permissions",
+        "--add-dir",
+        "{cwd}",
+        "--output-format",
+        "stream-json",
+        "-p"
+      ],
+      "patterns": {
+        "quota": [
+          "resource exhausted",
+          "quota exceeded",
+          "quota will reset",
+          "rate limit reached",
+          "resource_exhausted",
+          "429",
+          "rate limit",
+          "quota reached",
+          "individual quota"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "try again later"
+        ],
+        "auth": [
+          "not signed in",
+          "authentication required",
+          "unauthorized",
+          "login required"
+        ]
+      },
+      "note": "Mismo CLI que antigravity con un modelo del grupo Claude/GPT, que tiene cuota propia (semanal y de 5 h) separada del grupo Gemini. Entra cuando gemini se agota.",
+      "quota_pool": "antigravity-claude"
+    },
+    "antigravity-flash": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "agy-stream",
+      "command": [
+        "agy",
+        "--model",
+        "{model}",
+        "--mode=accept-edits",
+        "--dangerously-skip-permissions",
+        "--add-dir",
+        "{cwd}",
+        "--output-format",
+        "stream-json",
+        "-p"
+      ],
+      "patterns": {
+        "quota": [
+          "resource exhausted",
+          "quota exceeded",
+          "quota will reset",
+          "rate limit reached",
+          "resource_exhausted",
+          "429",
+          "rate limit",
+          "quota reached",
+          "individual quota"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "try again later"
+        ],
+        "auth": [
+          "not signed in",
+          "authentication required",
+          "unauthorized",
+          "login required"
+        ]
+      },
+      "note": "Gemini 3.7 Flash: gama media del grupo Gemini; gasta menos cuota por tarea que Pro.",
+      "quota_pool": "antigravity-gemini"
+    },
+    "opencode-free": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "opencode-free/mimo",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Modelo gratuito de OpenCode Zen: sin cuota ni coste; calidad menor, ultimo recurso.",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient account funds",
+          "insufficient credits",
+          "rate limit",
+          "429",
+          "402",
+          "quota"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset"
+        ],
+        "auth": [
+          "model unavailable",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "provider.auth",
+          "only available hosted"
+        ]
+      }
+    },
+    "opencode-go-kimi": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "opencode-go/kimi-k2.7-code",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Plan OpenCode Go; cada modelo tiene su propio limite mensual (5 h = 20 %, semana = 50 %).",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient account funds",
+          "insufficient credits",
+          "rate limit",
+          "429",
+          "402",
+          "quota"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset"
+        ],
+        "auth": [
+          "model unavailable",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "provider.auth",
+          "only available hosted"
+        ]
+      }
+    },
+    "opencode-go-glmflash": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "opencode-go/glm-5.3-flash",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Plan OpenCode Go; cada modelo tiene su propio limite mensual (5 h = 20 %, semana = 50 %).",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient account funds",
+          "insufficient credits",
+          "rate limit",
+          "429",
+          "402",
+          "quota"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset"
+        ],
+        "auth": [
+          "model unavailable",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "provider.auth",
+          "only available hosted"
+        ]
+      }
+    },
+    "opencode-go-minimax": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "opencode-go/minimax-m3",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Plan OpenCode Go; cada modelo tiene su propio limite mensual (5 h = 20 %, semana = 50 %).",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient account funds",
+          "insufficient credits",
+          "rate limit",
+          "429",
+          "402",
+          "quota"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset"
+        ],
+        "auth": [
+          "model unavailable",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "provider.auth",
+          "only available hosted"
+        ]
+      }
+    },
+    "opencode-go-qwenplus": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "opencode-go/qwen3.7-plus",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Plan OpenCode Go; cada modelo tiene su propio limite mensual (5 h = 20 %, semana = 50 %).",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient account funds",
+          "insufficient credits",
+          "rate limit",
+          "429",
+          "402",
+          "quota"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset"
+        ],
+        "auth": [
+          "model unavailable",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "provider.auth",
+          "only available hosted"
+        ]
+      }
+    },
+    "opencode-go-glm": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "opencode-go/glm-5.3",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Plan OpenCode Go; cada modelo tiene su propio limite mensual (5 h = 20 %, semana = 50 %).",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient account funds",
+          "insufficient credits",
+          "rate limit",
+          "429",
+          "402",
+          "quota"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset"
+        ],
+        "auth": [
+          "model unavailable",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "provider.auth",
+          "only available hosted"
+        ]
+      }
+    },
+    "opencode-go-qwenmax": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "opencode-go/qwen3.8-max",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Plan OpenCode Go; cada modelo tiene su propio limite mensual (5 h = 20 %, semana = 50 %).",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient account funds",
+          "insufficient credits",
+          "rate limit",
+          "429",
+          "402",
+          "quota"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset"
+        ],
+        "auth": [
+          "model unavailable",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "provider.auth",
+          "only available hosted"
+        ]
+      }
+    },
+    "opencode-go-luna": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "opencode-go/gpt-6-luna",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Plan OpenCode Go; cada modelo tiene su propio limite mensual (5 h = 20 %, semana = 50 %).",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient account funds",
+          "insufficient credits",
+          "rate limit",
+          "429",
+          "402",
+          "quota"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset"
+        ],
+        "auth": [
+          "model unavailable",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "provider.auth",
+          "only available hosted"
+        ]
+      }
+    },
+    "opencode-go-dsflash": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "opencode-go/deepseek-v4.1-flash",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "DeepSeek V4.1 Flash: 4x de uso en el plan Go ($60/mes). Requiere opt-in en el workspace; si no, responde provider.auth y se enfria.",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient account funds",
+          "insufficient credits",
+          "rate limit",
+          "429",
+          "402",
+          "quota"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset"
+        ],
+        "auth": [
+          "model unavailable",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "provider.auth",
+          "only available hosted"
+        ]
+      }
+    },
+    "ali-dsflash": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "alibaba",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Suscripcion Alibaba Model Studio (Token Plan) via el proveedor `bailian-cli` definido en ~/.config/opencode/opencode.json.",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient",
+          "quota",
+          "rate limit",
+          "429",
+          "402",
+          "limit reached",
+          "exhausted"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset",
+          "invalid-output"
+        ],
+        "auth": [
+          "provider.auth",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "model unavailable"
+        ]
+      }
+    },
+    "ali-qwenplus": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "alibaba",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Suscripcion Alibaba Model Studio (Token Plan) via el proveedor `bailian-cli` definido en ~/.config/opencode/opencode.json.",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient",
+          "quota",
+          "rate limit",
+          "429",
+          "402",
+          "limit reached",
+          "exhausted"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset",
+          "invalid-output"
+        ],
+        "auth": [
+          "provider.auth",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "model unavailable"
+        ]
+      }
+    },
+    "ali-glm": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "alibaba",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Suscripcion Alibaba Model Studio (Token Plan) via el proveedor `bailian-cli` definido en ~/.config/opencode/opencode.json.",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient",
+          "quota",
+          "rate limit",
+          "429",
+          "402",
+          "limit reached",
+          "exhausted"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset",
+          "invalid-output"
+        ],
+        "auth": [
+          "provider.auth",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "model unavailable"
+        ]
+      }
+    },
+    "ali-qwenflash": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "alibaba",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Suscripcion Alibaba Model Studio (Token Plan) via el proveedor `bailian-cli` definido en ~/.config/opencode/opencode.json.",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient",
+          "quota",
+          "rate limit",
+          "429",
+          "402",
+          "limit reached",
+          "exhausted"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset",
+          "invalid-output"
+        ],
+        "auth": [
+          "provider.auth",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "model unavailable"
+        ]
+      }
+    },
+    "ali-qwenmax": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "alibaba",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Suscripcion Alibaba Model Studio (Token Plan) via el proveedor `bailian-cli` definido en ~/.config/opencode/opencode.json.",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient",
+          "quota",
+          "rate limit",
+          "429",
+          "402",
+          "limit reached",
+          "exhausted"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset",
+          "invalid-output"
+        ],
+        "auth": [
+          "provider.auth",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "model unavailable"
+        ]
+      }
+    },
+    "ali-dspro": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "alibaba",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Suscripcion Alibaba Model Studio (Token Plan) via el proveedor `bailian-cli` definido en ~/.config/opencode/opencode.json.",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient",
+          "quota",
+          "rate limit",
+          "429",
+          "402",
+          "limit reached",
+          "exhausted"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset",
+          "invalid-output"
+        ],
+        "auth": [
+          "provider.auth",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "model unavailable"
+        ]
+      }
+    },
+    "codex-sol": {
+      "enabled": true,
+      "prompt_transport": "stdin",
+      "output_format": "codex-jsonl",
+      "command": [
+        "codex",
+        "exec",
+        "--model",
+        "{model}",
+        "--json",
+        "-c",
+        "model_reasoning_effort={effort}",
+        "--sandbox",
+        "workspace-write",
+        "-"
+      ],
+      "patterns": {
+        "quota": [
+          "usage limit exceeded",
+          "rate limit reached",
+          "quota reached",
+          "too many requests",
+          "hit your usage limit",
+          "purchase more credits",
+          "rate limit",
+          "429"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "try again later"
+        ],
+        "auth": [
+          "not logged in",
+          "authentication required",
+          "invalid api key",
+          "unauthorized"
+        ]
+      },
+      "quota_pool": "codex",
+      "note": "GPT-5.6 Terra: gama media de Codex; misma bolsa de cuota que Sol, menos gasto por tarea."
+    },
+    "codex-luna": {
+      "enabled": true,
+      "prompt_transport": "stdin",
+      "output_format": "codex-jsonl",
+      "command": [
+        "codex",
+        "exec",
+        "--model",
+        "{model}",
+        "--json",
+        "-c",
+        "model_reasoning_effort={effort}",
+        "--sandbox",
+        "workspace-write",
+        "-"
+      ],
+      "patterns": {
+        "quota": [
+          "usage limit exceeded",
+          "rate limit reached",
+          "quota reached",
+          "too many requests",
+          "hit your usage limit",
+          "purchase more credits",
+          "rate limit",
+          "429"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "try again later"
+        ],
+        "auth": [
+          "not logged in",
+          "authentication required",
+          "invalid api key",
+          "unauthorized"
+        ]
+      },
+      "quota_pool": "codex",
+      "note": "GPT-5.6 Terra: gama media de Codex; misma bolsa de cuota que Sol, menos gasto por tarea."
+    },
+    "opencode-free-nemotron": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "opencode-free/nemotron",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-write.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Modelo gratuito de OpenCode Zen: sin cuota ni coste; calidad menor, ultimo recurso.",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient account funds",
+          "insufficient credits",
+          "rate limit",
+          "429",
+          "402",
+          "quota"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset"
+        ],
+        "auth": [
+          "model unavailable",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "provider.auth",
+          "only available hosted"
+        ]
+      }
+    },
+    "claude-sonnet-coder": {
+      "enabled": true,
+      "prompt_transport": "stdin",
+      "output_format": "claude-stream",
+      "command": [
+        "claude",
+        "--model",
+        "{model}",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--dangerously-skip-permissions"
+      ],
+      "patterns": {
+        "quota": [
+          "usage limit reached",
+          "rate limit reached",
+          "quota reached",
+          "too many requests",
+          "usage limit",
+          "rate_limit_error",
+          "rate limit"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "try again later"
+        ],
+        "auth": [
+          "not logged in",
+          "authentication required",
+          "invalid api key",
+          "unauthorized"
+        ]
+      },
+      "quota_pool": "claude"
+    }
+  },
+  "cooldown_seconds": 1800,
+  "cooldown_path": "/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/.agent/logs/cooldowns.json",
+  "idle_timeout_seconds": 600,
+  "role_models": {
+    "coder": {
+      "antigravity-sonnet": "claude-sonnet-4-6",
+      "antigravity-flash": "gemini-3.8-flash-high",
+      "antigravity": "gemini-3.1-pro-high",
+      "codex": "gpt-6-sol",
+      "opencode-free": "opencode/mimo-v2.6-flash-free",
+      "opencode-go-kimi": "opencode-go/kimi-k2.7-code",
+      "opencode-go-glmflash": "opencode-go/glm-5.3-flash",
+      "opencode-go-minimax": "opencode-go/minimax-m3",
+      "opencode-go-qwenplus": "opencode-go/qwen3.7-plus",
+      "opencode-go-glm": "opencode-go/glm-5.3",
+      "opencode-go-qwenmax": "opencode-go/qwen3.8-max",
+      "opencode-go-luna": "opencode-go/gpt-6-luna",
+      "opencode-go-dsflash": "opencode-go/deepseek-v4.1-flash",
+      "ali-dsflash": "bailian-cli/deepseek-v4.1-flash",
+      "ali-qwenplus": "bailian-cli/qwen3.7-plus",
+      "ali-glm": "bailian-cli/glm-5.3",
+      "ali-qwenflash": "bailian-cli/qwen3.8-flash",
+      "ali-qwenmax": "bailian-cli/qwen3.8-max",
+      "ali-dspro": "bailian-cli/deepseek-v4-pro",
+      "codex-sol": "gpt-6-sol",
+      "codex-luna": "gpt-6-luna",
+      "opencode-free-nemotron": "opencode/nemotron-3-ultra-free",
+      "claude-sonnet-coder": "claude-sonnet-5-5"
+    }
+  },
+  "role_efforts": {
+    "coder": {
+      "codex": "medium",
+      "codex-sol": "medium",
+      "codex-luna": "medium"
+    }
+  },
+  "worktree_links": {
+    "mcp/node_modules": "/mnt/ssd500/projects/personal/cortex/mcp/node_modules",
+    "dashboard/node_modules": "/mnt/ssd500/projects/personal/cortex/dashboard/node_modules"
+  },
+  "rotate_first": {
+    "coder": 5
+  },
+  "escalation": {
+    "coder": {
+      "after_failures": 2,
+      "providers": [
+        "claude-sonnet-coder"
+      ]
+    }
+  },
+  "hourly_budget": {
+    "claude-sonnet-coder": 20
+  }
+}

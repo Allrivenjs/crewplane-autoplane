@@ -1,0 +1,312 @@
+{
+  "timeout_seconds": 1800,
+  "role_order": {
+    "thinker": [
+      "claude",
+      "codex",
+      "ali-dspro",
+      "opencode-go"
+    ],
+    "reviewer": [
+      "codex",
+      "claude",
+      "claude-sonnet",
+      "ali-dspro",
+      "opencode-go"
+    ]
+  },
+  "log_path": "/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/.agent/logs/cortex.jsonl",
+  "providers": {
+    "claude": {
+      "enabled": true,
+      "prompt_transport": "stdin",
+      "output_format": "claude-stream",
+      "command": [
+        "claude",
+        "--model",
+        "{model}",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        "plan",
+        "--permission-prompts",
+        "none"
+      ],
+      "patterns": {
+        "quota": [
+          "usage limit reached",
+          "rate limit reached",
+          "quota reached",
+          "too many requests",
+          "usage limit",
+          "rate_limit_error",
+          "rate limit"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "try again later"
+        ],
+        "auth": [
+          "not logged in",
+          "authentication required",
+          "invalid api key",
+          "unauthorized"
+        ]
+      },
+      "quota_pool": "claude"
+    },
+    "codex": {
+      "enabled": true,
+      "prompt_transport": "stdin",
+      "output_format": "codex-jsonl",
+      "command": [
+        "codex",
+        "exec",
+        "--model",
+        "{model}",
+        "--json",
+        "-c",
+        "model_reasoning_effort={effort}",
+        "--sandbox",
+        "read-only",
+        "-"
+      ],
+      "patterns": {
+        "quota": [
+          "usage limit exceeded",
+          "rate limit reached",
+          "quota reached",
+          "too many requests",
+          "hit your usage limit",
+          "purchase more credits",
+          "rate limit",
+          "429"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "try again later"
+        ],
+        "auth": [
+          "not logged in",
+          "authentication required",
+          "invalid api key",
+          "unauthorized"
+        ]
+      },
+      "quota_pool": "codex"
+    },
+    "antigravity": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "agy-stream",
+      "command": [
+        "agy",
+        "--model",
+        "{model}",
+        "--mode=plan",
+        "--add-dir",
+        "{cwd}",
+        "--output-format",
+        "stream-json",
+        "-p"
+      ],
+      "patterns": {
+        "quota": [
+          "resource exhausted",
+          "quota exceeded",
+          "quota will reset",
+          "rate limit reached",
+          "resource_exhausted",
+          "429",
+          "rate limit",
+          "quota reached",
+          "individual quota"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "try again later"
+        ],
+        "auth": [
+          "not signed in",
+          "authentication required",
+          "unauthorized",
+          "login required"
+        ]
+      },
+      "quota_pool": "antigravity-gemini"
+    },
+    "opencode-go": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "opencode-go/kimi-k3",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-readonly.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "Plan OpenCode Go (opencode-go/<modelo>): requiere conectar la API key de Go con `opencode auth login`; hasta entonces responde «Model unavailable» y se enfria. Solo lectura: edit denegado.",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient account funds",
+          "insufficient credits",
+          "rate limit",
+          "429",
+          "402",
+          "quota"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset"
+        ],
+        "auth": [
+          "model unavailable",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "provider.auth",
+          "only available hosted"
+        ]
+      }
+    },
+    "ali-dspro": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "opencode-json",
+      "quota_pool": "alibaba",
+      "command": [
+        "env",
+        "OPENCODE_CONFIG=/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/config/opencode-readonly.json",
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--model",
+        "{model}"
+      ],
+      "note": "DeepSeek V4 Pro por la suscripcion Alibaba, solo lectura (perfil opencode-readonly.json).",
+      "patterns": {
+        "quota": [
+          "provider.quota",
+          "insufficient",
+          "quota",
+          "rate limit",
+          "429",
+          "402",
+          "limit reached",
+          "exhausted"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "503",
+          "timeout",
+          "econnreset",
+          "invalid-output"
+        ],
+        "auth": [
+          "provider.auth",
+          "provider.no-route",
+          "unauthorized",
+          "401",
+          "invalid api key",
+          "model unavailable"
+        ]
+      }
+    },
+    "claude-sonnet": {
+      "enabled": true,
+      "prompt_transport": "stdin",
+      "output_format": "claude-stream",
+      "command": [
+        "claude",
+        "--model",
+        "{model}",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        "plan",
+        "--permission-prompts",
+        "none"
+      ],
+      "patterns": {
+        "quota": [
+          "usage limit reached",
+          "rate limit reached",
+          "quota reached",
+          "too many requests",
+          "usage limit",
+          "rate_limit_error",
+          "rate limit"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "try again later"
+        ],
+        "auth": [
+          "not logged in",
+          "authentication required",
+          "invalid api key",
+          "unauthorized"
+        ]
+      },
+      "quota_pool": "claude"
+    }
+  },
+  "cooldown_seconds": 1800,
+  "cooldown_path": "/mnt/ssd500/projects/personal/cortex/crewplane-multi-agent-sandbox/.agent/logs/cooldowns.json",
+  "idle_timeout_seconds": 420,
+  "role_models": {
+    "thinker": {
+      "claude": "claude-opus-5-5",
+      "codex": "gpt-6-sol",
+      "opencode-go": "opencode-go/kimi-k3",
+      "ali-dspro": "bailian-cli/deepseek-v4-pro"
+    },
+    "reviewer": {
+      "codex": "gpt-6-sol",
+      "claude": "claude-opus-5-5",
+      "opencode-go": "opencode-go/kimi-k3",
+      "ali-dspro": "bailian-cli/deepseek-v4-pro",
+      "claude-sonnet": "claude-sonnet-5-5"
+    }
+  },
+  "role_efforts": {
+    "thinker": {
+      "codex": "high"
+    },
+    "reviewer": {
+      "codex": "high"
+    }
+  },
+  "hourly_budget": {
+    "claude": 20,
+    "claude-sonnet": 20
+  }
+}

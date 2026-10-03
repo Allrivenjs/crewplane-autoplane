@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Mantiene como maximo MAX tableros vivos, lanzando uno por modulo de la cola.
+cd /mnt/ssd500/projects/personal/cortex
+MAX=${MAX:-5}
+QUEUE=("$@")
+for m in "${QUEUE[@]}"; do
+  while [ "$(pgrep -fc '[r]un-board --only')" -ge "$MAX" ]; do sleep 30; done
+  rm -f .crewplane/boards/only-$m.pid
+  echo "$(date '+%F %H:%M') lanzo $m"
+  nohup .crewplane/bin/run-board --only $m --gate tests --merge >> .crewplane/board-$m.log 2>&1 &
+  sleep 20
+done
+echo "$(date '+%F %H:%M') cola vacia"

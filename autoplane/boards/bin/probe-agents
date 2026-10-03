@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Prove each provider can do what the board will ask of it, in a real worktree.
+
+For every (role, provider) the board relies on, force that single provider and
+ask for the four things a task needs: read a repo file, create a file, edit an
+existing file, and run a command. Then check the worktree, not the agent's word.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+SB = ROOT / "crewplane-multi-agent-sandbox"
+CACHE = Path.home() / ".cache/crewplane/probes"
+
+WRITE_TASK = """Haz exactamente estas cuatro cosas en este directorio y nada mas:
+1. Lee la primera linea de README.md y escribela tal cual en PROBE_READ.txt.
+2. Crea core/internal/store/probe_created.go con `package store` y una funcion
+   exportada ProbeCreated() que devuelva "ok".
+3. Anade al final de core/internal/store/visibility_norm_probe.go (crealo si no
+   existe, con `package store`) un comentario `// probe edit`.
+4. Ejecuta `go version` y escribe su salida completa en PROBE_CMD.txt.
+Reporta al final que hiciste. No toques ningun otro archivo."""
+
+READ_TASK = """Solo lectura. Haz exactamente esto y responde con los resultados:
+1. Ejecuta `git diff --stat HEAD~1 HEAD` en este directorio y copia su salida.
+2. Ejecuta `go vet ./core/internal/store/` y di si termino sin errores.
+3. Lee core/internal/store/assets.go y di cuantas funciones exportadas tiene.
+No modifiques ningun archivo. Termina con la linea:
+VEREDICTO task_worktree: APROBADO"""
+
+CASES = [
+    # (label, role, profile, provider)
+    ("coder/antigravity", "coder", "write", "antigravity"),
+    ("coder/codex",       "coder", "write", "codex"),
+    ("reviewer/codex",    "reviewer", "read", "codex"),
+    ("thinker/codex",     "thinker", "read", "codex"),
+]
+
+
+def forced_config(profile: str, role: str, provider: str) -> Path:
+    src = json.loads((SB / f"config/agent-fallback-cortex-{profile}.json").read_text())
+    src["role_order"] = {role: [provider]}
+    src["cooldown_seconds"] = 0
+    tmp = Path(tempfile.mkstemp(suffix=".json", prefix=f"probe-{role}-{provider}-")[1])
+    tmp.write_text(json.dumps(src))
+    return tmp
+
+
+def worktree(label: str) -> Path:
+    path = CACHE / label.replace("/", "-") / "checkout"
+    subprocess.run(["git", "worktree", "remove", "--force", str(path)], cwd=ROOT, capture_output=True)
+    subprocess.run(["rm", "-rf", str(path.parent)])
+    subprocess.run(["git", "worktree", "add", "-q", "--detach", str(path), "HEAD"], cwd=ROOT, check=True)
+    return path
+
+
+def run_case(case):
+    label, role, profile, provider = case
+    wt = worktree(label)
+    cfg = forced_config(profile, role, provider)
+    task = WRITE_TASK if profile == "write" else READ_TASK
+    proc = subprocess.run(
+        [str(SB / "bin/agent-fallback"), "--role", role, "--config", str(cfg)],
+        input=task, text=True, capture_output=True, cwd=wt, timeout=900)
+    status = proc.stderr.strip().splitlines()[-1].replace("agent-fallback: ", "") if proc.stderr.strip() else "?"
+    checks = {}
+    if profile == "write":
+        readme_first = (ROOT / "README.md").read_text().splitlines()[0].strip()
+        pr = wt / "PROBE_READ.txt"
+        checks["leer"] = pr.is_file() and readme_first in pr.read_text()
+        cg = wt / "core/internal/store/probe_created.go"
+        checks["crear"] = cg.is_file() and "ProbeCreated" in cg.read_text()
+        ed = wt / "core/internal/store/visibility_norm_probe.go"
+        checks["editar"] = ed.is_file() and "probe edit" in ed.read_text()
+        pc = wt / "PROBE_CMD.txt"
+        checks["comando"] = pc.is_file() and "go version" in pc.read_text()
+        dirty = subprocess.run(["git", "status", "--short"], cwd=wt, capture_output=True, text=True).stdout
+        touched = [l[3:] for l in dirty.splitlines()]
+        allowed = {"PROBE_READ.txt", "PROBE_CMD.txt", "core/internal/store/probe_created.go",
+                   "core/internal/store/visibility_norm_probe.go"}
+        checks["solo lo pedido"] = set(touched) <= allowed
+    else:
+        out = proc.stdout
+        checks["diff via comando"] = "files changed" in out or "file changed" in out or "insertion" in out
+        checks["vet via comando"] = "vet" in out.lower()
+        checks["leer archivo"] = "exportad" in out.lower() or "func" in out.lower()
+        checks["veredicto"] = "VEREDICTO task_worktree: APROBADO" in out
+        dirty = subprocess.run(["git", "status", "--short"], cwd=wt, capture_output=True, text=True).stdout
+        checks["no escribio"] = dirty.strip() == ""
+    subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=ROOT, capture_output=True)
+    cfg.unlink(missing_ok=True)
+    return label, status, checks, proc.stdout[-400:]
+
+
+def main() -> int:
+    CACHE.mkdir(parents=True, exist_ok=True)
+    with ThreadPoolExecutor(max_workers=len(CASES)) as pool:
+        results = list(pool.map(run_case, CASES))
+    ok_all = True
+    for label, status, checks, tail in results:
+        good = all(checks.values())
+        ok_all &= good
+        print(f"\n{'OK ' if good else 'FALLA'} {label:20} {status}")
+        for k, v in checks.items():
+            print(f"      {'✓' if v else '✗'} {k}")
+        if not good:
+            print("      --- ultima salida ---")
+            print("      " + tail.replace("\n", "\n      "))
+    return 0 if ok_all else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

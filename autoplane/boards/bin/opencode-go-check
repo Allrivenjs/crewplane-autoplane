@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Comprueba si el plan OpenCode Go esta conectado y responde. Uso: opencode-go-check
+set -u
+echo "Modelos opencode-go visibles:"
+opencode models </dev/null 2>/dev/null | grep '^opencode-go/' | tr '\n' ' '; echo
+echo "Sonda (deepseek-v4-pro):"
+opencode run --format json --auto --model opencode-go/deepseek-v4-pro "Reply with the single word OK." </dev/null 2>/dev/null \
+  | python3 -c "import sys,json
+for l in sys.stdin:
+    try: e=json.loads(l)
+    except Exception: continue
+    if e.get('type')=='error': print('  ERROR', json.dumps(e['error'])[:200])
+    if e.get('type')=='text': print('  OK ->', e['part'].get('text','')[:60])"
+echo "Si sale ERROR provider.auth / no-route: conecta la key con  opencode auth login  (OpenCode Go) y repite."

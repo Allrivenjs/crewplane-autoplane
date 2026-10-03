@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Lanza un tablero por TAREA en cuanto sus dependencias salen de Pendiente.
+
+Uso: CORTEX_PLAN=mapa-cerebro MAX=6 .crewplane/bin/task-chain B04 B05 B06 B07
+MAX (entorno, por defecto 6) limita los tableros vivos lanzados por este proceso.
+
+A diferencia de plan-chain (un tablero por modulo, tareas en fila), aqui cada
+tarea corre en su propio `run-board --only <TAREA>`, asi las tareas
+independientes de un modulo avanzan a la vez. Las dependencias se leen de
+plan.json en cada vuelta (clave por tarea o, si no hay, la del modulo), y un
+tablero de modulo vivo excluye las tareas que cubre (run-board.overlapping_board).
+"""
+import collections, os, re, subprocess, sys, time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+MAX = int(os.environ.get("MAX", "6"))
+MAX_LAUNCHES = int(os.environ.get("MAX_LAUNCHES", "6"))  # por tarea y por vida de este proceso
+modules = {m.upper() for m in sys.argv[1:]}
+launched: dict[str, subprocess.Popen] = {}
+launches = collections.Counter()
+
+
+def load_rb():
+    # Recargar en cada vuelta: plan.json (dependencias) puede cambiar en marcha.
+    return SourceFileLoader("rb", str(ROOT / ".crewplane/bin/run-board")).load_module()
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M"), msg, flush=True)
+
+
+while True:
+    rb = load_rb()
+    rows = rb.board_tasks()
+    runnable = [t for t, _, st in rows if t.split("-")[0] in modules and st.strip() in rb.RUNNABLE]
+    for p in launched.values():
+        p.poll()  # recoger hijos terminados
+    # Vivos = tableros por tarea con pid vivo, lanzados por este proceso o por uno anterior.
+    alive = [scope[5:] for scope, _ in rb.live_boards()
+             if scope.startswith("only-") and re.fullmatch(r"[A-Z]\d{2}-\d{2}", scope[5:])]
+    if not runnable and not alive:
+        log("sin tareas pendientes en " + " ".join(sorted(modules)))
+        break
+    for task in runnable:
+        if len(alive) >= MAX:
+            break
+        if task in alive or launches[task] >= MAX_LAUNCHES:
+            continue
+        if rb.unmet_dependencies(task) or rb.overlapping_board(f"only-{task}"):
+            continue
+        out = open(ROOT / f".crewplane/board-{task}.log", "a")
+        launched[task] = subprocess.Popen(
+            [str(ROOT / ".crewplane/bin/run-board"), "--only", task, "--gate", "tests", "--merge"],
+            cwd=ROOT, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        launches[task] += 1
+        alive.append(task)
+        log(f"lanzo {task} (pid {launched[task].pid}, vez {launches[task]})")
+    time.sleep(60)

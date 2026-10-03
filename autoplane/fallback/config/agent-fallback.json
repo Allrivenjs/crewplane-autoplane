@@ -1,0 +1,159 @@
+{
+  "timeout_seconds": 1800,
+  "role_order": {
+    "thinker": [
+      "claude",
+      "antigravity"
+    ],
+    "coder": [
+      "antigravity",
+      "claude"
+    ],
+    "reviewer": [
+      "claude",
+      "antigravity"
+    ]
+  },
+  "log_path": ".agent/logs/agent-fallback.jsonl",
+  "providers": {
+    "claude": {
+      "enabled": true,
+      "prompt_transport": "stdin",
+      "output_format": "claude-stream",
+      "command": [
+        "claude",
+        "--model",
+        "{model}",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        "plan",
+        "--permission-prompts",
+        "none"
+      ],
+      "patterns": {
+        "quota": [
+          "usage limit reached",
+          "rate limit reached",
+          "quota reached",
+          "too many requests",
+          "usage limit",
+          "rate_limit_error",
+          "rate limit"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "try again later"
+        ],
+        "auth": [
+          "not logged in",
+          "authentication required",
+          "invalid api key",
+          "unauthorized"
+        ]
+      }
+    },
+    "codex": {
+      "enabled": true,
+      "prompt_transport": "stdin",
+      "output_format": "codex-jsonl",
+      "command": [
+        "codex",
+        "exec",
+        "--model",
+        "{model}",
+        "--json",
+        "--sandbox",
+        "read-only",
+        "-"
+      ],
+      "patterns": {
+        "quota": [
+          "usage limit exceeded",
+          "rate limit reached",
+          "quota reached",
+          "too many requests",
+          "hit your usage limit",
+          "purchase more credits",
+          "rate limit",
+          "429"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "try again later"
+        ],
+        "auth": [
+          "not logged in",
+          "authentication required",
+          "invalid api key",
+          "unauthorized"
+        ]
+      }
+    },
+    "antigravity": {
+      "enabled": true,
+      "prompt_transport": "argument",
+      "output_format": "agy-stream",
+      "command": [
+        "agy",
+        "--model",
+        "{model}",
+        "--mode=plan",
+        "--add-dir",
+        "{cwd}",
+        "--output-format",
+        "stream-json",
+        "-p"
+      ],
+      "patterns": {
+        "quota": [
+          "resource exhausted",
+          "quota exceeded",
+          "quota will reset",
+          "rate limit reached",
+          "resource_exhausted",
+          "429",
+          "rate limit"
+        ],
+        "temporary": [
+          "overloaded",
+          "temporarily unavailable",
+          "service unavailable",
+          "try again later"
+        ],
+        "auth": [
+          "not signed in",
+          "authentication required",
+          "unauthorized",
+          "login required"
+        ]
+      }
+    }
+  },
+  "cooldown_seconds": 1800,
+  "cooldown_path": ".agent/logs/cooldowns.json",
+  "idle_timeout_seconds": 420,
+  "role_models": {
+    "thinker": {
+      "claude": "opus",
+      "antigravity": "gemini-3.1-pro-high",
+      "codex": "gpt-5.6-sol"
+    },
+    "coder": {
+      "antigravity": "gemini-3.1-pro-high",
+      "codex": "gpt-5.6-sol",
+      "claude": "sonnet"
+    },
+    "reviewer": {
+      "claude": "opus",
+      "codex": "gpt-5.6-sol",
+      "antigravity": "gemini-3.1-pro-high"
+    }
+  }
+}

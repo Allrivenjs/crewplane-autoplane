@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Vacía el almacén de resoluciones cuya clave de datos ya no se puede abrir
+# ("no data key ... epoch 2026-09-30 cannot be unwrapped"): ni el secreto anterior
+# ni una clave de recuperación existen. El Core crea una clave nueva con el
+# CORTEX_RESOLVE_SECRET actual y el index/map reconstruye los nombres del código.
+# Lo ejecuta la persona: borra filas de la base real `cortex`.
+set -euo pipefail
+ROOT=/mnt/ssd500/projects/personal/cortex
+cd "$ROOT"
+set -a; . ~/.config/cortex/core.env; set +a
+stamp=$(date +%Y%m%dT%H%M%S)
+
+echo "== 0. Estado actual"
+psql "$CORTEX_DSN" -At -c "select 'claves', count(*) from resolution_keys union all select 'entradas', count(*) from resolution_entries"
+
+echo "== 1. Respaldo de las dos tablas (por si apareciera el secreto anterior)"
+mkdir -p backups
+pg_dump "$CORTEX_DSN" -Fc -t resolution_keys -t resolution_entries -f "backups/resolution-store-$stamp.dump"
+ls -la "backups/resolution-store-$stamp.dump"
+
+# Confirmación: interactiva, o CONFIRM=SI en el entorno cuando no hay teclado (prefijo ! de Claude Code).
+ok=${CONFIRM:-}
+if [ -z "$ok" ] && [ -t 0 ]; then
+  read -r -p "¿Vaciar resolution_keys y resolution_entries? Escribe SI para continuar: " ok
+fi
+[ "$ok" = "SI" ] || { echo "cancelado: nada borrado (confirma con CONFIRM=SI)"; exit 1; }
+
+echo "== 2. Parar el Core, vaciar, arrancar"
+systemctl --user stop cortex-core
+psql "$CORTEX_DSN" -v ON_ERROR_STOP=1 -c "begin; delete from resolution_entries; delete from resolution_keys; commit;"
+systemctl --user start cortex-core
+for i in $(seq 1 60); do curl -sf http://127.0.0.1:8742/health >/dev/null && break; sleep 1; done
+echo "Core: $(curl -s http://127.0.0.1:8742/health)"
+
+echo "== 3. Reconstruir nombres del código y arquitectura"
+export CORTEX_TOKEN=$(cat ~/.config/cortex/agent-token)
+bin/cortex index . --project cortex --apply 2>&1 | tail -3
+bin/cortex map . --project cortex --apply 2>&1 | tail -2
+psql "$CORTEX_DSN" -At -c "select 'claves', count(*) from resolution_keys union all select 'entradas', count(*) from resolution_entries"
+echo "== listo. Respaldo de las tablas: backups/resolution-store-$stamp.dump"

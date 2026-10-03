@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Lanza un tablero por modulo en cuanto sus dependencias salen de Pendiente.
+
+Uso: CORTEX_PLAN=mapa-cerebro .crewplane/bin/plan-chain B01 B02 B03 ...
+MAX (entorno, por defecto 4) limita los tableros vivos a la vez.
+"""
+import os, subprocess, sys, time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+rb = SourceFileLoader("rb", str(ROOT / ".crewplane/bin/run-board")).load_module()
+MAX = int(os.environ.get("MAX", "4"))
+queue = [m.upper() for m in sys.argv[1:]]
+launched = {}
+
+
+def pending(module):
+    return [t for t, _, st in rb.board_tasks() if t.startswith(module + "-") and st.strip() in rb.RUNNABLE]
+
+
+def alive(module):
+    p = launched.get(module)
+    return p is not None and p.poll() is None
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M"), msg, flush=True)
+
+
+while queue or any(alive(m) for m in launched):
+    for module in list(queue):
+        if not pending(module):
+            log(f"{module}: sin tareas pendientes")
+            queue.remove(module)
+            continue
+        if sum(alive(m) for m in launched) >= MAX:
+            break
+        first = pending(module)[0]
+        blocked = rb.unmet_dependencies(first)
+        if blocked:
+            continue
+        (ROOT / ".crewplane/boards" / f"only-{module}.pid").unlink(missing_ok=True)
+        out = open(ROOT / f".crewplane/board-{module}.log", "a")
+        launched[module] = subprocess.Popen(
+            [str(ROOT / ".crewplane/bin/run-board"), "--only", module, "--gate", "tests", "--merge"],
+            cwd=ROOT, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        log(f"lanzo {module} (pid {launched[module].pid})")
+        queue.remove(module)
+    time.sleep(60)
+log("cadena terminada")

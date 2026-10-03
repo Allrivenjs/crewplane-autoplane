@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""Render a Crewplane workflow for one task of the Tencent Agent Memory plan.
+
+Usage: .crewplane/bin/task-workflow M01-01
+Prints the generated workflow path on stdout.
+
+Shape per task (the one that merged M01-02):
+
+  plan.thinker       one strong model, skipped when planes/<TASK>.md exists
+  implement.iterate  cheap executor + strong reviewer, audit rounds by group
+
+The reviewer's verdict is binding: run-board refuses to merge a RECHAZADO.
+"""
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+import json as _json
+import os as _os
+
+# Which plan this orchestrator runs. Tencent by default; another plan lives in
+# docs/plans/<CORTEX_PLAN>/ with the same layout and a plan.json that declares
+# its groups, review rounds and dependencies (2026-09-30, mapa-cerebro).
+PLAN_NAME = _os.environ.get("CORTEX_PLAN", "tencent-agent-memory")
+PLANS = ROOT / "docs/plans" / PLAN_NAME
+PLAN_REL = f"docs/plans/{PLAN_NAME}"
+OUT = ROOT / ".crewplane/workflows/generated"
+
+# Objective groups, taken from the plan's milestones (E0..E6) and module
+# priorities. Order matters: each group builds on the previous one.
+GROUPS = {
+    "G1": ("Base: recursos gobernados, contexto acotado y grafo vigente (P0)", ["M01", "M03", "M06"]),
+    "G2": ("Memoria de sesion, skills y procedencia (P1)", ["M04", "M02", "M11"]),
+    "G3": ("Conocimiento conectado, clientes y panel (P1)", ["M05", "M09", "M08"]),
+    "G4": ("Ampliaciones opcionales y operacion (P2/P3)", ["M07", "M10", "M12"]),
+}
+# Review rounds per group. The core group gets the most chances to converge;
+# optional work gets one review and stops if it misses.
+AUDIT_ROUNDS = {"G1": 2, "G2": 2, "G3": 2, "G4": 1}
+
+TASK_ROW = re.compile(r"^\|\s*\[(?P<id>[A-Z]\d{2}-\d{2})\]\((?P<plan>[^)#]+)[^)]*\)\s*\|\s*(?P<entrega>[^|]+?)\s*\|")
+
+
+# Dependencias entre modulos segun la linea «Dependencias» de cada plan de modulo.
+# Un modulo o una tarea concreta; el orquestador no arranca una tarea hasta que
+# todo lo listado haya salido de Pendiente (fusionado o hecho).
+DEPENDS = {
+    "M01": [],
+    "M12": [],
+    "M03": ["M01"],
+    "M11": ["M01"],
+    "M06": ["M01", "M12-01"],
+    "M02": ["M01", "M03"],
+    "M04": ["M01", "M03"],
+    "M05": ["M01", "M03"],
+    "M09": ["M01", "M03"],
+    "M07": ["M01", "M03", "M02"],
+    "M08": ["M01", "M04"],
+    "M10": ["M01", "M02", "M03", "M04", "M05"],
+}
+
+
+_PLAN_CONFIG = PLANS / "plan.json"
+if _PLAN_CONFIG.is_file():
+    _cfg = _json.loads(_PLAN_CONFIG.read_text(encoding="utf-8"))
+    GROUPS = {k: (v["title"], v["modules"]) for k, v in _cfg["groups"].items()}
+    AUDIT_ROUNDS = {k: int(v.get("audit_rounds", 2)) for k, v in _cfg["groups"].items()}
+    DEPENDS = {k: list(v) for k, v in _cfg.get("depends", {}).items()}
+
+
+def group_of(task_id: str) -> str:
+    module = task_id.split("-")[0]
+    for key, (_, modules) in GROUPS.items():
+        if module in modules:
+            return key
+    return list(GROUPS)[-1]
+
+
+def find_task(task_id: str) -> tuple[str, str]:
+    board = (PLANS / "SEGUIMIENTO.md").read_text(encoding="utf-8")
+    for line in board.splitlines():
+        match = TASK_ROW.match(line)
+        if match and match.group("id") == task_id:
+            return match.group("plan"), match.group("entrega")
+    raise SystemExit(f"task-workflow: {task_id} no aparece en SEGUIMIENTO.md")
+
+
+def saved_plan(task_id: str) -> bool:
+    """A plan already paid for. Reusing it skips the whole thinking phase."""
+    path = PLANS / "planes" / f"{task_id}.md"
+    return path.is_file() and bool(path.read_text(encoding="utf-8", errors="replace").strip())
+
+
+TEMPLATE = """---
+schema_version: "1.0"
+name: Tencent @@TASK@@
+description: "@@ENTREGA@@ (@@TASK@@, group @@GROUP@@): cheap executor reviewed by a strong model."
+worktrees:
+  task_worktree:
+    kind: worktree
+    create_branch: true
+nodes:
+@@PLAN_NODE@@  - id: implement.iterate
+    mode: sequential
+@@NEEDS@@    depth: 2
+    audit_rounds: @@ROUNDS@@
+    continue_on_failure: true
+    providers:
+      - provider: coder
+        role: executor
+      - provider: reviewer
+        role: reviewer
+---
+@@PLAN_SECTION@@
+## implement.iterate
+
+Task @@TASK@@ — @@ENTREGA@@. Group @@GROUP@@: @@GROUP_TITLE@@.
+
+STYLE (both roles): terse technical English. No greetings, no preamble, no
+restating the task, no narration of what you are about to do. Fragments OK.
+Reference code as `path:line`; never paste whole files or long snippets.
+CONTEXT BUDGET: never list, read, grep or open anything under `node_modules/`,
+`.git/`, `dist/`, `build/`, `vendor/` or `*.lock` files. They are huge and
+never part of the task; every byte you read costs quota. Search with
+`git ls-files` / `git grep` (they skip ignored dirs) instead of `ls -R`, `find`
+or `grep -r` from the root. Read only the files the plan names plus what a
+`git grep` for the symbol you are changing points to.
+Source documents below are in Spanish; answer in English anyway. Code
+identifiers, semantic fields and commit-facing text stay in English per repo
+convention.
+
+Module plan, with acceptance criteria:
+{{file:@@PLAN_PATH@@}}
+
+Agreed breakdown for this task:
+@@PLAN_REF@@
+
+### If you are the executor
+
+You run inside an isolated git worktree of Cortex with write access. Implement
+only @@TASK@@. Follow repo conventions. Code tasks deliver code; a document
+accompanies the change, never replaces it.
+
+If the breakdown has "Hallazgos"/"Findings" from a previous review, or a
+review from this run, fix exactly those first. Only then widen.
+
+Work only inside the current directory (`pwd`). `git worktree list` and the
+`.git` file reveal the main repository: never `cd` there, never use absolute
+paths outside your worktree, never `git -C` into it. Edits outside the worktree
+are discarded and the round counts as empty.
+
+Leave changes uncommitted. NEVER run `git commit`, `git checkout <branch>`,
+`git reset`, `git stash` or switch branches: the orchestrator captures the
+worktree diff itself and a moved HEAD voids the round. Reading a `salvage/...`
+branch (`git diff`, `git show`) and pulling files with
+`git checkout <branch> -- <path>` is allowed (HEAD stays).
+
+New SQL migrations: take the next free number after `git ls-files
+core/internal/store/migrations | tail -1`; other tasks merge in parallel and the
+orchestrator renumbers yours if the number is taken by then, so never hardcode
+its number anywhere but the filename.
+
+Surgical edits: change the lines that need changing; do not rewrite whole
+files. Reuse existing helpers before adding new ones. No abstractions, options
+or layers beyond the acceptance criteria.
+
+Do not run the full test suite: the orchestrator runs `make test` on your
+result in a separate worktree and that decides. Building or testing the package
+you just touched is fine; looping the whole suite is not. For anything hitting
+Postgres use your own empty database:
+`CORTEX_TEST_DSN="@@TEST_DSN@@" CORTEX_GRAPH_TEST_DSN="@@TEST_DSN@@" CI=1 go test ./internal/<pkg>`
+(without CORTEX_GRAPH_TEST_DSN the AGE tests in `graph` and `httpapi` skip
+silently; the gate runs them and a skipped test that would fail there is a
+failed round). The shared dev
+database holds other rounds' migration checksums and will show failures that
+are not yours.
+
+MEASUREMENTS: when an acceptance criterion asks for a number or an output "on
+Cortex", "on the extra repo", "real", "live" or "after a full scan", produce it with
+the orchestrator's throwaway Core, never with the shared Core on :8742, the
+`cortex` database or a real token (this one absolute path is allowed):
+`/mnt/ssd500/projects/personal/cortex/.crewplane/bin/scratch-core [--with extra-repo] -- sh -c '<your command using $CORTEX_BIN, $CORTEX_SERVER, $CORTEX_TOKEN>'`.
+It builds YOUR worktree, indexes and maps it into a private database, runs the
+command and deletes everything. Paste its literal output into the task's
+contract. A task whose criterion is a measurement is not done until that output
+is pasted; do not describe what the number would be.
+
+Never create or edit `.gitattributes`, `.gitignore`, `.git/*`, git hooks or
+git config. Never run `npm install`, `npm ci`, `pnpm` or `yarn`: `mcp/node_modules`
+and `dashboard/node_modules` are already linked into your worktree, so
+`npx tsc --noEmit` works as is. Installed packages ship `.gitattributes`
+files and Crewplane aborts the whole run when it finds one anywhere in the
+checkout (M03-02, 2026-09-20, twice).
+
+Everything left in the worktree gets merged: no scaffolding. No `*.patch`,
+`patch_*` scripts, notes or dumps at the repo root; delete helpers before you
+finish. Such files get the result rejected. Never edit SEGUIMIENTO.md, any
+task's Estado column, or `@@PLAN_REL@@/planes/*.md`: the
+orchestrator owns those files and drops your changes to them.
+
+Final report, at most 10 lines: files changed (path — what), what a validator
+should check. Nothing else.
+
+### If you are the reviewer
+
+Same worktree, read-only. The task started from commit `@@BASE@@`. Everything
+the executor did is `git diff @@BASE@@` — committed and uncommitted changes
+alike. From round 2 on, earlier rounds arrive as commits and `git status` is
+clean: that is expected and is never a reason to reject. Review that diff
+against the acceptance criteria of @@TASK@@, not the executor's description.
+An empty `git diff @@BASE@@`, or one that does not implement the task, is a
+failure.
+
+Measurements: if a criterion is a number or output "on Cortex/extra repo" or
+"real/live", the literal output of `.crewplane/bin/scratch-core` pasted in the
+contract satisfies it; a missing paste is a Major Issue, and so is a prose
+claim of what the number would be. Never require the shared Core on :8742,
+the `cortex` database, a person, a browser trace or a screen reader: those are
+the orchestrator's, not the executor's.
+
+Reject when it misses acceptance, breaks a project invariant, leaves a
+migration or compatibility risk unresolved, or changes what the task did not
+ask for. Approving by default is not your job; rejecting on style is not
+either. When you reject, say file and required change precisely enough to fix
+without guessing: your text is the executor's next input.
+
+Your verdict is enforced: the orchestrator does not merge `CHANGES_REQUESTED`
+even if tests pass, and takes `## Major Issues` as the reason. Use the review
+block Crewplane requests at the end (`## Major Issues`, `## Minor Issues`,
+`## Nitpicks`, `VERDICT: CHANGES_REQUESTED | NITS_ONLY | NO_FINDINGS`), one
+issue per line as `path:line — change`. No prose outside the block beyond one
+line. An executor scaffold file (`*.patch`, `patch_*`, loose notes at root) is
+a Major Issue.
+
+Only a Major Issue justifies `CHANGES_REQUESTED`: missed acceptance, broken
+invariant, data or security risk, task left undone. Minor and Nitpick only →
+`NITS_ONLY`. Every extra round costs one execution and one review; minor
+details get fixed later without paying the cycle again.
+"""
+
+PLAN_NODE = """  - id: plan.thinker
+    mode: sequential
+    worktree: none
+    providers: [thinker]
+"""
+
+PLAN_SECTION = """
+## plan.thinker
+
+Read-only: modify nothing. Answer in terse technical English (the source
+documents are in Spanish). No preamble, no narration; bullets over prose.
+
+Project direction and module coverage:
+{{file:@@PLAN_REL@@/README.md}}
+
+Plan of the module containing the task:
+{{file:@@PLAN_PATH@@}}
+
+Task to implement: @@TASK@@ — @@ENTREGA@@ (group @@GROUP@@: @@GROUP_TITLE@@).
+
+Deliver an executable breakdown: concrete files to touch, order of changes,
+migrations if any, acceptance criteria taken from the plan. Do not invent
+paths: cite only paths in the plan or verified by reading the repo. If the
+plan looks wrong, say so. Write the full breakdown in your answer, not in a
+separate file.
+
+The implementer is a mid-tier model with limited quota; your plan is what
+keeps it from drifting:
+- Minimum scope that meets acceptance. No speculative abstractions, options or
+  layers. Reuse what exists (cite path and symbol) before proposing new code.
+- An explicit "Out of scope" section: what this task does NOT touch even if
+  the module plan mentions it later.
+- Each file with its concrete change in one or two lines; above ~15 files,
+  propose splitting the task and say where to cut.
+- Tests: only those proving acceptance. Name existing ones that must keep
+  passing and new ones with what they check.
+- Real risks (migration, compatibility, data) with a one-line mitigation; no
+  generic lists.
+"""
+
+
+BASE_DSN = "postgres://cortex:cortex@127.0.0.1:5433/cortex?sslmode=disable"
+
+
+def task_dsn(task_id: str) -> str:
+    """A database of its own for the executor's test runs on this task."""
+    import os
+    from urllib.parse import urlparse
+    dsn = os.environ.get("CORTEX_TEST_DSN") or os.environ.get("CORTEX_DSN") or BASE_DSN
+    return urlparse(dsn)._replace(path="/cortex_task_" + task_id.lower().replace("-", "_")).geturl()
+
+
+def render(task_id: str, plan_file: str, entrega: str, base: str = "") -> str:
+    plan_path = f"{PLAN_REL}/{plan_file}"
+    if not (ROOT / plan_path).is_file():
+        raise SystemExit(f"task-workflow: falta el plan {plan_path}")
+    group = group_of(task_id)
+    title = GROUPS[group][0]
+    reused = saved_plan(task_id)
+    fill = {
+        "@@TASK@@": task_id,
+        "@@PLAN_REL@@": PLAN_REL,
+        "@@BASE@@": base or "HEAD",
+        "@@ENTREGA@@": entrega.replace('"', "'"),
+        "@@GROUP@@": group,
+        "@@GROUP_TITLE@@": title,
+        "@@PLAN_PATH@@": plan_path,
+        "@@ROUNDS@@": str(AUDIT_ROUNDS[group]),
+        "@@TEST_DSN@@": task_dsn(task_id),
+        "@@PLAN_NODE@@": "" if reused else PLAN_NODE,
+        "@@NEEDS@@": "" if reused else "    needs: [plan.thinker]\n",
+        "@@PLAN_SECTION@@": "" if reused else PLAN_SECTION,
+        "@@PLAN_REF@@": ("{{file:" + PLAN_REL + "/planes/" + task_id + ".md}}"
+                         if reused else "{{plan.thinker.output}}"),
+    }
+    out = TEMPLATE
+    for _ in range(2):  # PLAN_SECTION itself carries tokens
+        for key, value in fill.items():
+            out = out.replace(key, value)
+    return out
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) not in (2, 3):
+        print(__doc__, file=sys.stderr)
+        return 2
+    base = argv[2] if len(argv) == 3 else ""
+    task_id = argv[1].upper()
+    plan_file, entrega = find_task(task_id)
+    OUT.mkdir(parents=True, exist_ok=True)
+    target = OUT / f"{task_id.lower()}.task.md"
+    target.write_text(render(task_id, plan_file, entrega, base), encoding="utf-8")
+    print(target.relative_to(ROOT))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
